@@ -102,7 +102,8 @@ class E2EpSE(pl.LightningModule):
    
         #Get the dual-emb model and teacher model
         
-        dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
+        # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
+        dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
         dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
         state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
         self.dual_emb_model = SpeakerEncoderDualWrapper(emb_dim=emb_dim)
@@ -164,25 +165,36 @@ class E2EpSE(pl.LightningModule):
         with torch.no_grad():
             emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
             emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
-            gt_embs = torch.stack([emb1, emb2], dim=1)  # [B, 2, emb_dim]
+            emb3 = self.single_sp_model(source[:, 2, :])
+            gt_embs = torch.stack([emb1, emb2, emb3], dim=1)  # [B, 3, emb_dim]
         
-        randomly_chosen_source = random.randint(0,1) #0, or 1
+        randomly_chosen_source = random.randint(0,2) #0,1 or 2
         if randomly_chosen_source == 0:
             emb_tgt = emb1 #[B, emb_dim]
             target_speech = source[:, 0, :]
-        else:
+        elif randomly_chosen_source == 1:
             emb_tgt = emb2
             target_speech = source[:, 1, :] #[B, T]
+        else:
+            emb_tgt = emb3
+            target_speech = source[:, 2, :] 
         
-        embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
-        e1 = embs[:, 0, :]
-        e2 = embs[:, 1, :]
+        embs = self.dual_emb_model(mix)# [B, 3, emb_dim]
+        # e1 = embs[:, 0, :]
+        # e2 = embs[:, 1, :]
+        # e3 = embs[:, 2, :]
 
-        cosine1 = cosine(e1, emb_tgt)
-        cosine2 = cosine(e2, emb_tgt)
-        choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
-        pred_emb = torch.where(choose_mask, e1, e2)
-        
+        cosines = F.cosine_similarity(
+            embs, 
+            emb_tgt.unsqueeze(1).expand_as(embs),  # [B, S, D]
+            dim=-1
+        )  # [B, S]
+
+        best_idx = cosines.argmax(dim=1)              # [B]
+        batch_idx = torch.arange(embs.size(0), device=embs.device)
+        pred_emb = embs[batch_idx, best_idx, :]       # [B, D]
+        #condition dccrn on pred_emb
+
         #condition dccrn on pred_emb
         #convert mix to spec
       
@@ -224,32 +236,35 @@ class E2EpSE(pl.LightningModule):
         with torch.no_grad():
             emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
             emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
-            gt_embs = torch.stack([emb1, emb2], dim=1)  # [B, 2, emb_dim]
+            emb3 = self.single_sp_model(source[:, 2, :]) #(B, embed_dim)
+            gt_embs = torch.stack([emb1, emb2, emb3], dim=1)  # [B, 2, emb_dim]
         
-        randomly_chosen_source = random.randint(0,1) #0, or 1
+        randomly_chosen_source = random.randint(0,2) #0, or 1
         if randomly_chosen_source == 0:
             emb_tgt = emb1 #[B, emb_dim]
-            #true
             target_speech = source[:, 0, :]
-            #reversed
-            # emb_tgt = emb2
-
-        else:
+        elif randomly_chosen_source == 1:
             emb_tgt = emb2
-            #true
             target_speech = source[:, 1, :] #[B, T]
-            #reversed
-            # emb_tgt = emb1
+        else:
+            emb_tgt = emb3
+            target_speech = source[:, 2, :]
 
-        
-        embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
-        e1 = embs[:, 0, :]
-        e2 = embs[:, 1, :]
+        embs = self.dual_emb_model(mix)# [B, 3, emb_dim]
+        # e1 = embs[:, 0, :]
+        # e2 = embs[:, 1, :]
+        # e3 = embs[:, 2, :]
 
-        cosine1 = cosine(e1, emb_tgt)
-        cosine2 = cosine(e2, emb_tgt)
-        choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
-        pred_emb = torch.where(choose_mask, e1, e2)
+        cosines = F.cosine_similarity(
+            embs, 
+            emb_tgt.unsqueeze(1).expand_as(embs),  # [B, S, D]
+            dim=-1
+        )  # [B, S]
+
+        best_idx = cosines.argmax(dim=1)              # [B]
+        batch_idx = torch.arange(embs.size(0), device=embs.device)
+        pred_emb = embs[batch_idx, best_idx, :]       # [B, D]        
+    
         #condition dccrn on pred_emb
         out = self.forward(mix, emb = pred_emb) #list of three wavs
         out = out[0]
@@ -281,7 +296,6 @@ class E2EpSE(pl.LightningModule):
             self.log(f"val/{k}", v, prog_bar=True)
         self.metrics.reset()
 
-        # 2) Log audio samples (5 fixed samples)
         if not hasattr(self, "fixed_val_batch"):
             # Save a fixed batch on first val step
             mix, src, _ = next(iter(self.trainer.datamodule.val_dataloader()))
@@ -292,7 +306,7 @@ class E2EpSE(pl.LightningModule):
         src = src.to(self.device)
 
         # Determine GT target for logging
-        idx = random.randint(0,1)
+        idx = random.randint(0,2)
         tgt = src[:, idx, :]   # always log speaker 0 for visualization
 
         # Run forward pass
@@ -301,18 +315,28 @@ class E2EpSE(pl.LightningModule):
             # but for visualization pick one speaker deterministically
             emb1 = self.single_sp_model(src[:, 0, :])
             emb2 = self.single_sp_model(src[:, 1, :])
+            emb3 = self.single_sp_model(src[:, 2, :])
             if idx == 0:
                 emb_tgt = emb1
-            else:
+            elif idx == 1:
                 emb_tgt = emb2
-            embs = self.dual_emb_model(mix)
-            e1 = embs[:, 0, :]
-            e2 = embs[:, 1, :]
+            else:
+                emb_tgt = emb3
 
-            cosine1 = cosine(e1, emb_tgt)
-            cosine2 = cosine(e2, emb_tgt)
-            choose_mask = (cosine1 > cosine2).unsqueeze(-1)
-            pred_emb = torch.where(choose_mask, e1, e2)
+            embs = self.dual_emb_model(mix)# [B, 3, emb_dim]
+            # e1 = embs[:, 0, :]
+            # e2 = embs[:, 1, :]
+            # e3 = embs[:, 2, :]
+
+            cosines = F.cosine_similarity(
+                embs, 
+                emb_tgt.unsqueeze(1).expand_as(embs),  # [B, S, D]
+                dim=-1
+            )  # [B, S]
+
+            best_idx = cosines.argmax(dim=1)              # [B]
+            batch_idx = torch.arange(embs.size(0), device=embs.device)
+            pred_emb = embs[batch_idx, best_idx, :]       # [B, D]    
 
             pred = self.forward(mix, emb = pred_emb)  # list of three wavs
             pred = pred[0]
@@ -452,15 +476,15 @@ class E2EpSE(pl.LightningModule):
 # ---------------------------------------
 if __name__ == "__main__":
     DATA_ROOT = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix" 
-    SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
-
+    # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=8, 
+        batch_size=1, 
         num_workers=20, # Set this to your preference
-        num_speakers=2
+        num_speakers=3
     )
 
     model = E2EpSE(
@@ -471,24 +495,25 @@ if __name__ == "__main__":
     )
 
     wandb_logger = WandbLogger(
-        project="pDCCRN_2sp",
-        name="pDCCRN_2sp_spex+",
+        project="pDCCRN_3sp",
+        name="pDCCRN_3sp_spex+",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/wandb_logs",
+        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
         monitor="train/SI-SDR_loss",
         mode="min",
-        save_top_k=1,
+        save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/"
+        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/"
     )
 
     trainer = pl.Trainer(
         strategy="ddp",
         accelerator="gpu",
+        precision="16-mixed",    # <-- mixed precision
         devices=[0, 1, 2, 3],
         # devices=[0],
         max_epochs=100,
@@ -519,8 +544,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    # trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/best-epoch=15-val_separation=0.000.ckpt")
+    trainer.fit(model, datamodule=dm)
+    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/best-epoch=15-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
