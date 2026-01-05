@@ -393,27 +393,28 @@ class E2EpSE(pl.LightningModule):
             e2 = embs[:, 1, :]
 
             # Evaluate BOTH targets for each mixture
-            idx = np.random.choice([0, 1])
-            emb_tgt = emb1 if idx == 0 else emb2
-            tgt_wav = source[:, idx, :]               # [B,T]
+            # idx = np.random.choice([0, 1])
+            for idx in [0, 1]:
+                emb_tgt = emb1 if idx == 0 else emb2
+                tgt_wav = source[:, idx, :]               # [B,T]
 
-            # pick the mixture-derived embedding closer to emb_tgt
-            c1 = cosine(e1, emb_tgt)
-            c2 = cosine(e2, emb_tgt)
-            choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-            pred_emb = torch.where(choose_mask, e1, e2)
+                # pick the mixture-derived embedding closer to emb_tgt
+                c1 = cosine(e1, emb_tgt)
+                c2 = cosine(e2, emb_tgt)
+                choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
+                pred_emb = torch.where(choose_mask, e1, e2)
 
-            # TasNet forward (list of 3 wavs)
-            out = self.forward(mix, emb=pred_emb)
-            pred = out[0]                             # pick highest-res output
+                # TasNet forward (list of 3 wavs)
+                out = self.forward(mix, emb=pred_emb)
+                pred = out[0]                             # pick highest-res output
 
-            # trim to match
-            min_len = min(pred.shape[-1], tgt_wav.shape[-1])
-            pred = pred[..., :min_len]
-            tgt_wav = tgt_wav[..., :min_len]
+                # trim to match
+                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                pred = pred[..., :min_len]
+                tgt_wav = tgt_wav[..., :min_len]
 
-            # accumulate metrics
-            self.test_metrics.update(pred, tgt_wav)
+                # accumulate metrics
+                self.test_metrics.update(pred, tgt_wav)
 
         return {}
 
@@ -470,13 +471,13 @@ if __name__ == "__main__":
         speaker_map_path=SPEAKER_MAP,   # ONLY train map here
     )
 
-    wandb_logger = WandbLogger(
-        project="pDCCRN_2sp",
-        name="pDCCRN_2sp_spex+",
-        # name='test_run',
-        log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/wandb_logs",
-    )
+    # wandb_logger = WandbLogger(
+    #     project="pDCCRN_2sp",
+    #     name="pDCCRN_2sp_spex+",
+    #     # name='test_run',
+    #     log_model=False,
+    #     save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/wandb_logs",
+    # )
 
     ckpt = pl.callbacks.ModelCheckpoint(
         monitor="train/SI-SDR_loss",
@@ -492,7 +493,7 @@ if __name__ == "__main__":
         devices=[0, 1, 2, 3],
         # devices=[0],
         max_epochs=100,
-        logger=wandb_logger,
+        # logger=wandb_logger,
         callbacks=[ckpt],
         gradient_clip_val=5.0,
         enable_checkpointing=True,

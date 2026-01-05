@@ -1,0 +1,4 @@
+lr: 0.0001
+finetune_encoder: false
+emb_dim: 256
+speaker_map_path: /mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json
