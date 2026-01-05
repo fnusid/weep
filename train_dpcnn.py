@@ -10,7 +10,7 @@ from pytorch_lightning.loggers import WandbLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 from dataset.dataloader import LibriMixDataModule       
-from models.convtasnet import ConvTasNet #TSE
+from models.dpcnn import DPCCN #TSE
 
 from metrics import SE_metrics
 import wandb
@@ -29,7 +29,7 @@ import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidharth./codebase/wesep/confs/config_tasnet.yaml")
+config_path = Path("/home/sidharth./codebase/wesep/confs/config_dpcnn.yaml")
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -38,19 +38,6 @@ hp = OmegaConf.merge(*docs)
 
 import numpy as np
 
-
-class Loss_Wrapper(nn.Module):
-    def __init__(self):
-        super(Loss_Wrapper, self).__init__()
-        self.loss_fn = auraloss.time.SISDRLoss()
-
-    def forward(self, pred, target):
-        total_loss = 0.0
-        loss_weights = [0.8, 0.1, 0.1]
-        for i, p in enumerate(pred):
-            loss = self.loss_fn(p, target)
-            total_loss += loss_weights[i] * loss
-        return total_loss
 
 
 def strip_model_prefix(state):
@@ -137,8 +124,8 @@ class E2EpSE(pl.LightningModule):
         # -----------------------------
         self.metrics = SE_metrics(device="cpu")  # will overwrite device at runtime
 
-        self.model = ConvTasNet(**hp.model_args.tse_model)
-        self.loss = Loss_Wrapper()
+        self.model = DPCCN(**hp.model_args.tse_model)
+        self.loss = auraloss.time.SISDRLoss()
 
 
     def forward(self, wav, emb=None):
@@ -198,11 +185,11 @@ class E2EpSE(pl.LightningModule):
         #condition dccrn on pred_emb
         #convert mix to spec
       
-        out = self.forward(mix, emb = pred_emb) #list of three wavs
-        pred_lens = min([o.shape[-1] for o in out])
-        min_len = min(pred_lens, source.shape[-1])
-        # out = out[..., :min_len]
-        out = [o[..., :min_len] for o in out]
+        out,_ = self.forward(mix, emb = pred_emb) 
+
+        min_len = min(out.shape[-1], source.shape[-1])
+        out = out[..., :min_len]
+
         source = target_speech[..., :min_len]
         loss = self.loss(out, source)
         # out_wav = self.audio_utils.spec2wav(out.detach().numpy(), mix_phase)
@@ -266,8 +253,8 @@ class E2EpSE(pl.LightningModule):
         pred_emb = embs[batch_idx, best_idx, :]       # [B, D]        
     
         #condition dccrn on pred_emb
-        out = self.forward(mix, emb = pred_emb) #list of three wavs
-        out = out[0]
+        out,_ = self.forward(mix, emb = pred_emb) #list of three wavs
+        # out = out[0]
 
         min_len = min(out.shape[-1], source.shape[-1])
         out = out[..., :min_len]
@@ -338,8 +325,8 @@ class E2EpSE(pl.LightningModule):
             batch_idx = torch.arange(embs.size(0), device=embs.device)
             pred_emb = embs[batch_idx, best_idx, :]       # [B, D]    
 
-            pred = self.forward(mix, emb = pred_emb)  # list of three wavs
-            pred = pred[0]
+            pred,_ = self.forward(mix, emb = pred_emb)  # list of three wavs
+      
 
 
         # Match lengths
