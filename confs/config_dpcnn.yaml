@@ -1,0 +1,14 @@
+model:
+  tse_model: DPCCN
+model_args:
+  tse_model:
+    win: 512
+    stride: 128
+    feature_dim: 257
+    tcn_blocks: 10
+    tcn_layers: 2
+    spk_emb_dim: 256
+    causal: False
+    spk_fuse_type: 'multiply'
+    use_spk_transform: False
+    joint_training: False
