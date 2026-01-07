@@ -410,22 +410,36 @@ class E2EpSE(pl.LightningModule):
         with torch.no_grad():
             emb1 = self.single_sp_model(source[:, 0, :])  # [B,D]
             emb2 = self.single_sp_model(source[:, 1, :])  # [B,D]
+            emb3 = self.single_sp_model(source[:, 2, :])  # [B,D]
 
             # --- dual embeddings from mixture (unordered) ---
             embs = self.dual_emb_model(mix)               # [B,2,D]
             e1 = embs[:, 0, :]
             e2 = embs[:, 1, :]
+            e3 = embs[:, 2, :]
 
             # Evaluate BOTH targets for each mixture
-            idx = np.random.choice([0, 1])
-            emb_tgt = emb1 if idx == 0 else emb2
+            idx = np.random.choice([0, 2])
+            # emb_tgt = emb1 if idx == 0 else emb2
+            if idx == 0:
+                emb_tgt = emb1
+            elif idx == 1:
+                emb_tgt = emb2
+            else:
+                emb_tgt = emb3
             tgt_wav = source[:, idx, :]               # [B,T]
 
             # pick the mixture-derived embedding closer to emb_tgt
             c1 = cosine(e1, emb_tgt)
             c2 = cosine(e2, emb_tgt)
-            choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-            pred_emb = torch.where(choose_mask, e1, e2)
+            c3 = cosine(e3, emb_tgt)
+            # choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
+            
+            # pred_emb = torch.where(choose_mask, e1, e2)
+            #three way
+            max_cosine, max_idx = torch.max(torch.stack([c1, c2, c3], dim=1), dim=1)  # [B]
+            batch_idx = torch.arange(embs.size(0), device=embs.device)
+            pred_emb = embs[batch_idx, max_idx, :]       # [B, D]
 
             # TasNet forward (list of 3 wavs)
             out = self.forward(mix, emb=pred_emb)
@@ -482,7 +496,7 @@ if __name__ == "__main__":
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=1, 
+        batch_size=8, 
         num_workers=24, # Set this to your preference
         num_speakers=3
     )
@@ -544,8 +558,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
-    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/best-epoch=15-val_separation=0.000.ckpt")
+    # trainer.fit(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/best-epoch=8-val_separation=0.000.ckpt")
+    trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/best-epoch=19-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
