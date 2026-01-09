@@ -381,27 +381,28 @@ class E2EpSE(pl.LightningModule):
             e2 = embs[:, 1, :]
 
             # Evaluate BOTH targets for each mixture
-            idx = np.random.choice([0, 1])
-            emb_tgt = emb1 if idx == 0 else emb2
-            tgt_wav = source[:, idx, :]               # [B,T]
+            # idx = np.random.choice([0, 1])
+            for idx in [0, 1]:
+                emb_tgt = emb1 if idx == 0 else emb2
+                tgt_wav = source[:, idx, :]               # [B,T]
 
-            # pick the mixture-derived embedding closer to emb_tgt
-            c1 = cosine(e1, emb_tgt)
-            c2 = cosine(e2, emb_tgt)
-            choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-            pred_emb = torch.where(choose_mask, e1, e2)
+                # pick the mixture-derived embedding closer to emb_tgt
+                c1 = cosine(e1, emb_tgt)
+                c2 = cosine(e2, emb_tgt)
+                choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
+                pred_emb = torch.where(choose_mask, e1, e2)
 
-            # TasNet forward (list of 3 wavs)
-            out = self.forward(mix, emb=pred_emb)
-            pred = out[0]  # [B, T']
-    
-            # trim to match
-            min_len = min(pred.shape[-1], tgt_wav.shape[-1])
-            pred = pred[..., :min_len]
-            tgt_wav = tgt_wav[..., :min_len]
+                # TasNet forward (list of 3 wavs)
+                out = self.forward(mix, emb=pred_emb)
+                pred = out[0]  # [B, T']
+        
+                # trim to match
+                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                pred = pred[..., :min_len]
+                tgt_wav = tgt_wav[..., :min_len]
 
-            # accumulate metrics
-            self.test_metrics.update(pred, tgt_wav)
+                # accumulate metrics
+                self.test_metrics.update(pred, tgt_wav)
 
         return {}
 
