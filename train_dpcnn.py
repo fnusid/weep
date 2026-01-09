@@ -393,8 +393,8 @@ class E2EpSE(pl.LightningModule):
 
             # TasNet forward (list of 3 wavs)
             out = self.forward(mix, emb=pred_emb)
-            pred = out[0]                             # pick highest-res output
-
+            pred = out[0]  # [B, T']
+    
             # trim to match
             min_len = min(pred.shape[-1], tgt_wav.shape[-1])
             pred = pred[..., :min_len]
@@ -446,7 +446,7 @@ if __name__ == "__main__":
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=1, 
+        batch_size=2, 
         num_workers=24, # Set this to your preference
         num_speakers=2
     )
@@ -508,8 +508,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
-    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/best-epoch=15-val_separation=0.000.ckpt")
+    # trainer.fit(model, datamodule=dm)
+    trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
