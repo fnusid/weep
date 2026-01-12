@@ -29,7 +29,7 @@ import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidharth./codebase/wesep/confs/config_dpcnn.yaml")
+config_path = Path("/home/sidharth./codebase/wesep/confs/conf_dpcnn.yaml")
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -37,6 +37,9 @@ with config_path.open("r", encoding="utf-8") as f:
 hp = OmegaConf.merge(*docs)
 
 import numpy as np
+
+
+
 
 
 
@@ -125,6 +128,7 @@ class E2EpSE(pl.LightningModule):
         self.metrics = SE_metrics(device="cpu")  # will overwrite device at runtime
 
         self.model = DPCCN(**hp.model_args.tse_model)
+        # self.load_tse_from_ckpt("/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
         self.loss = auraloss.time.SISDRLoss()
 
 
@@ -140,6 +144,18 @@ class E2EpSE(pl.LightningModule):
     # -----------------------------
     # TRAINING
     # -----------------------------
+    def load_tse_from_ckpt(self, ckpt_path: str, strict: bool = True):
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+
+        # keep only DPCCN keys saved under "model.*" (Lightning will prefix attributes)
+        filtered = {}
+        for k, v in sd.items():
+            if k.startswith("model."):
+                filtered[k.replace("model.", "", 1)] = v
+
+        missing, unexpected = self.model.load_state_dict(filtered, strict=strict)
+        print("Loaded TSE weights. Missing:", missing, "Unexpected:", unexpected)
     def training_step(self, batch, batch_idx):
         """
         batch: (wav, speaker_label)
@@ -397,34 +413,49 @@ class E2EpSE(pl.LightningModule):
         with torch.no_grad():
             emb1 = self.single_sp_model(source[:, 0, :])  # [B,D]
             emb2 = self.single_sp_model(source[:, 1, :])  # [B,D]
+            emb3 = self.single_sp_model(source[:, 2, :])  # [B,D]
 
             # --- dual embeddings from mixture (unordered) ---
             embs = self.dual_emb_model(mix)               # [B,2,D]
             e1 = embs[:, 0, :]
             e2 = embs[:, 1, :]
+            e3 = embs[:, 2, :]
 
             # Evaluate BOTH targets for each mixture
-            idx = np.random.choice([0, 1])
-            emb_tgt = emb1 if idx == 0 else emb2
-            tgt_wav = source[:, idx, :]               # [B,T]
+            # idx = np.random.choice([0, 2])
+            for idx in range(3):
+                # emb_tgt = emb1 if idx == 0 else emb2
+                if idx == 0:
+                    emb_tgt = emb1
+                elif idx == 1:
+                    emb_tgt = emb2
+                else:
+                    emb_tgt = emb3
+                tgt_wav = source[:, idx, :]               # [B,T]
 
-            # pick the mixture-derived embedding closer to emb_tgt
-            c1 = cosine(e1, emb_tgt)
-            c2 = cosine(e2, emb_tgt)
-            choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-            pred_emb = torch.where(choose_mask, e1, e2)
+                # pick the mixture-derived embedding closer to emb_tgt
+                c1 = cosine(e1, emb_tgt)
+                c2 = cosine(e2, emb_tgt)
+                c3 = cosine(e3, emb_tgt)
+                # choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
+                
+                # pred_emb = torch.where(choose_mask, e1, e2)
+                #three way
+                max_cosine, max_idx = torch.max(torch.stack([c1, c2, c3], dim=1), dim=1)  # [B]
+                batch_idx = torch.arange(embs.size(0), device=embs.device)
+                pred_emb = embs[batch_idx, max_idx, :]       # [B, D]
 
-            # TasNet forward (list of 3 wavs)
-            out = self.forward(mix, emb=pred_emb)
-            pred = out[0]                             # pick highest-res output
+                # TasNet forward (list of 3 wavs)
+                out = self.forward(mix, emb=pred_emb)
+                pred = out[0]                             # pick highest-res output
 
-            # trim to match
-            min_len = min(pred.shape[-1], tgt_wav.shape[-1])
-            pred = pred[..., :min_len]
-            tgt_wav = tgt_wav[..., :min_len]
+                # trim to match
+                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                pred = pred[..., :min_len]
+                tgt_wav = tgt_wav[..., :min_len]
 
-            # accumulate metrics
-            self.test_metrics.update(pred, tgt_wav)
+                # accumulate metrics
+                self.test_metrics.update(pred, tgt_wav)
 
         return {}
 
@@ -469,7 +500,7 @@ if __name__ == "__main__":
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=1, 
+        batch_size=2, 
         num_workers=24, # Set this to your preference
         num_speakers=3
     )
@@ -483,10 +514,10 @@ if __name__ == "__main__":
 
     wandb_logger = WandbLogger(
         project="pDCCRN_3sp",
-        name="pDCCRN_3sp_spex+",
+        name="pDCCRN_3sp_dpccn",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/wandb_logs",
+        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_3sp_dpccn_freshstart/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -494,7 +525,7 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_3sp_spex+/"
+        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_3sp_dpccn_freshstart/"
     )
 
     trainer = pl.Trainer(
@@ -531,8 +562,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
-    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_spex+/best-epoch=15-val_separation=0.000.ckpt")
+    # trainer.fit(model, datamodule=dm)
+    trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_3sp_dpccn_freshstart/best-epoch=18-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
