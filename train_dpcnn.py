@@ -19,6 +19,7 @@ sys.path.append("/home/sidharth./codebase/")
 
 from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper
 from wavlm_dual_embedding.model import SpeakerEncoderDualWrapper 
+from wavlm_dual_embedding.loss import LossWraper
 import random
 random.seed(42)
 import warnings
@@ -38,7 +39,14 @@ hp = OmegaConf.merge(*docs)
 
 import numpy as np
 
-
+def norm(grads):
+    # grads can contain None if allow_unused=True
+    s = 0.0
+    for g in grads:
+        if g is None: 
+            continue
+        s = s + (g.detach()**2).sum()
+    return torch.sqrt(s + 1e-12)
 
 def strip_model_prefix(state):
     new_state = {}
@@ -93,11 +101,13 @@ class E2EpSE(pl.LightningModule):
         # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
         dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
         state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
-        self.dual_emb_model = SpeakerEncoderDualWrapper(emb_dim=emb_dim)
+        self.dual_emb_model = SpeakerEncoderDualWrapper(emb_dim=emb_dim, finetune_wavlm=True) #joint training 
         self.dual_emb_model.load_state_dict(state, strict=True)
-        self.dual_emb_model.to(device).eval()
-        for param in self.dual_emb_model.parameters():
-            param.requires_grad = False
+        self.dual_emb_loss = LossWraper()
+
+        # self.dual_emb_model.to(device).eval()
+        # for param in self.dual_emb_model.parameters():
+        #     param.requires_grad = False
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
         teacher_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
@@ -123,6 +133,7 @@ class E2EpSE(pl.LightningModule):
         # 3. Embedding metrics (for validation)
         # -----------------------------
         self.metrics = SE_metrics(device="cpu")  # will overwrite device at runtime
+        # self.metrics = SE_metrics(device='cuda', use_only_sisdr=True)
 
         self.model = DPCCN(**hp.model_args.tse_model)
         self.loss = auraloss.time.SISDRLoss()
@@ -163,13 +174,15 @@ class E2EpSE(pl.LightningModule):
             target_speech = source[:, 1, :] #[B, T]
         
         embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
+
         e1 = embs[:, 0, :]
         e2 = embs[:, 1, :]
 
-        cosine1 = cosine(e1, emb_tgt)
-        cosine2 = cosine(e2, emb_tgt)
-        choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
-        pred_emb = torch.where(choose_mask, e1, e2)
+        # cosine1 = cosine(e1, emb_tgt)
+        # cosine2 = cosine(e2, emb_tgt)
+        # choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
+        # pred_emb = torch.where(choose_mask, e1, e2)
+
         
         #condition dccrn on pred_emb
         #convert mix to spec
@@ -180,8 +193,11 @@ class E2EpSE(pl.LightningModule):
         out = out[..., :min_len]
 
         source = target_speech[..., :min_len]
-        loss = self.loss(out, source)
+        loss_tse = self.loss(out, source)
         # out_wav = self.audio_utils.spec2wav(out.detach().numpy(), mix_phase)
+        #adjust weights accordingly
+        # breakpoint()
+        # loss = loss_tse + loss_emb
 
     
 
@@ -202,7 +218,7 @@ class E2EpSE(pl.LightningModule):
     # -----------------------------
 
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, drift=False):
         """
         For now we just compute arcface loss as a simple val loss.
         The clustering metrics are done in validation_epoch_end
@@ -217,30 +233,80 @@ class E2EpSE(pl.LightningModule):
         randomly_chosen_source = random.randint(0,1) #0, or 1
         if randomly_chosen_source == 0:
             emb_tgt = emb1 #[B, emb_dim]
+            other_emb_tgt = emb2
             #true
             target_speech = source[:, 0, :]
+            other_speech = source[:, 1, :]
             #reversed
             # emb_tgt = emb2
 
         else:
             emb_tgt = emb2
+            other_emb_tgt = emb1
             #true
             target_speech = source[:, 1, :] #[B, T]
+            other_speech = source[:, 0, :]
             #reversed
             # emb_tgt = emb1
 
-        
-        embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
-        e1 = embs[:, 0, :]
-        e2 = embs[:, 1, :]
+        with torch.no_grad():
+            embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
+            e1 = embs[:, 0, :]
+            e2 = embs[:, 1, :]
 
         cosine1 = cosine(e1, emb_tgt)
         cosine2 = cosine(e2, emb_tgt)
         choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
         pred_emb = torch.where(choose_mask, e1, e2)
+
+        cosine11 =  cosine(e1, other_emb_tgt)
+        cosine22 = cosine(e2, other_emb_tgt)
+        choose_mask_other = (cosine11 > cosine22).unsqueeze(-1)   # [B,1]
+        pred_emb2 = torch.where(choose_mask_other, e1, e2)
         #condition dccrn on pred_emb
-        out,_ = self.forward(mix, emb = pred_emb) #list of three wavs
+        if drift != True:
+            out,_ = self.forward(mix, emb = pred_emb) #list of three wavs
         # out = out[0]
+        else:
+            combinations = [[1,0],[0.75, 0.25], [0.5,0.5], [0.25,0.75],[0,1]]
+            metrics = {}
+            # metrics[i for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']] = []
+            # for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']:
+            for i in ['SI_SDR']:
+                metrics[i] = []
+            # breakpoint()
+            for comb in combinations:
+                weight1 = comb[0]
+                weight2 = comb[1]
+                drifted_emb = weight1 * pred_emb + weight2 * pred_emb2
+                out,_ = self.forward(mix, emb = drifted_emb) #list of three wavs
+                min_len = min(out.shape[-1], source.shape[-1])
+                out = out[..., :min_len]
+                target_speech = target_speech[..., :min_len]
+                other_speech = other_speech[..., :min_len]
+                self.metrics.update(out, target_speech)
+                met1 = self.metrics.compute()
+                self.metrics.reset()
+                self.metrics.update(out, other_speech)
+                met2 = self.metrics.compute()
+                self.metrics.reset()
+                for k in metrics.keys():
+                    metrics[k].append((met1[k], met2[k]))
+
+                '''
+                return {
+                "PESQ": float(torch.tensor(self.pesq_scores).nanmean()),
+                "STOI": float(torch.tensor(self.stoi_scores).nanmean()),
+                "SI_SDR": float(torch.tensor(self.sisdr_scores).nanmean()),
+                "SIG": float(torch.tensor(self.SIG).nanmean()),
+                "BAK": float(torch.tensor(self.BAK).nanmean()),
+                "OVRL": float(torch.tensor(self.OVRL).nanmean()),
+                }
+                '''
+            return metrics
+
+
+        
 
         min_len = min(out.shape[-1], source.shape[-1])
         out = out[..., :min_len]
@@ -448,7 +514,7 @@ if __name__ == "__main__":
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
         batch_size=2, 
-        num_workers=24, # Set this to your preference
+        num_workers=0, # Set this to your preference
         num_speakers=2
     )
 
@@ -461,10 +527,10 @@ if __name__ == "__main__":
 
     wandb_logger = WandbLogger(
         project="pDCCRN_2sp",
-        name="pDCCRN_2sp_dpccn",
+        name="pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/wandb_logs",
+        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -472,15 +538,15 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/"
+        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
     )
 
     trainer = pl.Trainer(
         strategy="ddp",
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
-        devices=[0, 1, 2, 3],
-        # devices=[0],
+        # devices=[0, 1, 2, 3],
+        devices=[0],
         max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -509,8 +575,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    # trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
+    trainer.fit(model, datamodule=dm)
+    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
