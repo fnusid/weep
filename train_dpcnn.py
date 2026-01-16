@@ -97,12 +97,12 @@ class E2EpSE(pl.LightningModule):
    
         #Get the dual-emb model and teacher model
         
-        dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
-        # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
-        dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
-        state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
+        # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
+        # ## dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
+        # dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
+        # state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
         self.dual_emb_model = SpeakerEncoderDualWrapper(emb_dim=emb_dim, finetune_wavlm=True) #joint training 
-        self.dual_emb_model.load_state_dict(state, strict=True)
+        # self.dual_emb_model.load_state_dict(state, strict=True)
         self.dual_emb_loss = LossWraper()
 
         # self.dual_emb_model.to(device).eval()
@@ -174,7 +174,7 @@ class E2EpSE(pl.LightningModule):
             target_speech = source[:, 1, :] #[B, T]
         
         embs = self.dual_emb_model(mix)# [B, 2, emb_dim]
-
+        loss_emb = self.dual_emb_loss(embs, gt_embs)
         e1 = embs[:, 0, :]
         e2 = embs[:, 1, :]
 
@@ -182,7 +182,16 @@ class E2EpSE(pl.LightningModule):
         # cosine2 = cosine(e2, emb_tgt)
         # choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
         # pred_emb = torch.where(choose_mask, e1, e2)
+        # scores
+ 
+        cos1 = cosine(e1, emb_tgt)  # [B]
+        cos2 = cosine(e2, emb_tgt)  # [B]
+        scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
 
+        tau = 0.5  # you can anneal this over training
+        w = torch.softmax(scores / tau, dim=1)     # [B,2]
+
+        pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
         
         #condition dccrn on pred_emb
         #convert mix to spec
@@ -193,9 +202,19 @@ class E2EpSE(pl.LightningModule):
         out = out[..., :min_len]
 
         source = target_speech[..., :min_len]
-        loss_tse = self.loss(out, source)
+        loss_tse = self.loss(out, source)   
         # out_wav = self.audio_utils.spec2wav(out.detach().numpy(), mix_phase)
         #adjust weights accordingly
+        emb_params = [p for p in self.dual_emb_model.parameters() if p.requires_grad]
+
+        # gradients of both losses w.r.t embedding model params
+        g1 = torch.autograd.grad(loss_tse, emb_params, retain_graph=True, allow_unused=True)
+        g2 = torch.autograd.grad(loss_emb, emb_params, retain_graph=True, allow_unused=True)
+        g1n = norm(g1)   # how hard TSE is trying to push the embedding model
+        g2n = norm(g2)   # how hard emb supervision pushes embedding model
+
+        alpha = (g1n / (g2n + 1e-8)).clamp(0.01, 100.0)
+        loss = loss_tse + alpha * loss_emb
         # breakpoint()
         # loss = loss_tse + loss_emb
 
@@ -203,7 +222,7 @@ class E2EpSE(pl.LightningModule):
 
 
         self.log(
-            "train/SI-SDR_loss",
+            "train/SI-SDR+COS_loss",
             loss,
             on_step=True,
             on_epoch=True,
@@ -254,56 +273,22 @@ class E2EpSE(pl.LightningModule):
             e1 = embs[:, 0, :]
             e2 = embs[:, 1, :]
 
-        cosine1 = cosine(e1, emb_tgt)
-        cosine2 = cosine(e2, emb_tgt)
-        choose_mask = (cosine1 > cosine2).unsqueeze(-1)   # [B,1]
-        pred_emb = torch.where(choose_mask, e1, e2)
+        cos1 = cosine(e1, emb_tgt)  # [B]
+        cos2 = cosine(e2, emb_tgt)  # [B]
+        scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
 
-        cosine11 =  cosine(e1, other_emb_tgt)
-        cosine22 = cosine(e2, other_emb_tgt)
-        choose_mask_other = (cosine11 > cosine22).unsqueeze(-1)   # [B,1]
-        pred_emb2 = torch.where(choose_mask_other, e1, e2)
+        tau = 0.5  # you can anneal this over training
+        w = torch.softmax(scores / tau, dim=1)     # [B,2]
+
+        pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
+
         #condition dccrn on pred_emb
         if drift != True:
             out,_ = self.forward(mix, emb = pred_emb) #list of three wavs
         # out = out[0]
         else:
-            combinations = [[1,0],[0.75, 0.25], [0.5,0.5], [0.25,0.75],[0,1]]
-            metrics = {}
-            # metrics[i for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']] = []
-            # for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']:
-            for i in ['SI_SDR']:
-                metrics[i] = []
-            # breakpoint()
-            for comb in combinations:
-                weight1 = comb[0]
-                weight2 = comb[1]
-                drifted_emb = weight1 * pred_emb + weight2 * pred_emb2
-                out,_ = self.forward(mix, emb = drifted_emb) #list of three wavs
-                min_len = min(out.shape[-1], source.shape[-1])
-                out = out[..., :min_len]
-                target_speech = target_speech[..., :min_len]
-                other_speech = other_speech[..., :min_len]
-                self.metrics.update(out, target_speech)
-                met1 = self.metrics.compute()
-                self.metrics.reset()
-                self.metrics.update(out, other_speech)
-                met2 = self.metrics.compute()
-                self.metrics.reset()
-                for k in metrics.keys():
-                    metrics[k].append((met1[k], met2[k]))
-
-                '''
-                return {
-                "PESQ": float(torch.tensor(self.pesq_scores).nanmean()),
-                "STOI": float(torch.tensor(self.stoi_scores).nanmean()),
-                "SI_SDR": float(torch.tensor(self.sisdr_scores).nanmean()),
-                "SIG": float(torch.tensor(self.SIG).nanmean()),
-                "BAK": float(torch.tensor(self.BAK).nanmean()),
-                "OVRL": float(torch.tensor(self.OVRL).nanmean()),
-                }
-                '''
-            return metrics
+            
+            raise NotImplementedError("Drift modeling not implemented in this snippet.")
 
 
         
@@ -363,10 +348,14 @@ class E2EpSE(pl.LightningModule):
             e1 = embs[:, 0, :]
             e2 = embs[:, 1, :]
 
-            cosine1 = cosine(e1, emb_tgt)
-            cosine2 = cosine(e2, emb_tgt)
-            choose_mask = (cosine1 > cosine2).unsqueeze(-1)
-            pred_emb = torch.where(choose_mask, e1, e2)
+            cos1 = cosine(e1, emb_tgt)  # [B]
+            cos2 = cosine(e2, emb_tgt)  # [B]
+            scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
+
+            tau = 0.5  # you can anneal this over training
+            w = torch.softmax(scores / tau, dim=1)     # [B,2]
+
+            pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
 
             pred,_ = self.forward(mix, emb = pred_emb)  # list of three wavs
             # pred = pred[0]
@@ -453,10 +442,14 @@ class E2EpSE(pl.LightningModule):
                 tgt_wav = source[:, idx, :]               # [B,T]
 
                 # pick the mixture-derived embedding closer to emb_tgt
-                c1 = cosine(e1, emb_tgt)
-                c2 = cosine(e2, emb_tgt)
-                choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-                pred_emb = torch.where(choose_mask, e1, e2)
+                cos1 = cosine(e1, emb_tgt)  # [B]
+                cos2 = cosine(e2, emb_tgt)  # [B]
+                scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
+
+                tau = 0.5  # you can anneal this over training
+                w = torch.softmax(scores / tau, dim=1)     # [B,2]
+
+                pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
 
                 # TasNet forward (list of 3 wavs)
                 out = self.forward(mix, emb=pred_emb)
@@ -496,7 +489,7 @@ class E2EpSE(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "train/SI-SDR_loss",
+                "monitor": "train/SI-SDR+COS_loss",
                 "interval": "epoch",
             },
         }
@@ -514,7 +507,7 @@ if __name__ == "__main__":
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
         batch_size=2, 
-        num_workers=0, # Set this to your preference
+        num_workers=20, # Set this to your preference
         num_speakers=2
     )
 
@@ -534,7 +527,7 @@ if __name__ == "__main__":
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
-        monitor="train/SI-SDR_loss",
+        monitor="train/SI-SDR+COS_loss",
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
@@ -545,8 +538,8 @@ if __name__ == "__main__":
         strategy="ddp",
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
-        # devices=[0, 1, 2, 3],
-        devices=[0],
+        devices=[0, 1, 2, 3],
+        # devices=[0],
         max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt],
