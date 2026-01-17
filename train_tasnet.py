@@ -420,7 +420,8 @@ class E2EpSE(pl.LightningModule):
 
             # Evaluate BOTH targets for each mixture
             idx = np.random.choice([0, 2])
-            # emb_tgt = emb1 if idx == 0 else emb2
+            # for idx in range(3):
+                # emb_tgt = emb1 if idx == 0 else emb2
             if idx == 0:
                 emb_tgt = emb1
             elif idx == 1:
