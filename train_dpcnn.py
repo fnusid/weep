@@ -15,7 +15,7 @@ from models.dpcnn import DPCCN #TSE
 from metrics import SE_metrics
 import wandb
 import sys
-sys.path.append("/home/sidharth./codebase/")
+sys.path.append("/home/sidcs/codebase/")
 
 from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper
 from wavlm_dual_embedding.model import SpeakerEncoderDualWrapper 
@@ -30,7 +30,7 @@ import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidharth./codebase/wesep/confs/config_dpcnn.yaml")
+config_path = Path("/home/sidcs/codebase/wesep/confs/config_dpcnn.yaml")
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -86,7 +86,7 @@ class E2EpSE(pl.LightningModule):
         lr: float = 1e-4,
         finetune_encoder: bool = False,
         emb_dim: int = 256,
-        speaker_map_path: str = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
+        speaker_map_path: str = "/home/sidcs/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -110,7 +110,7 @@ class E2EpSE(pl.LightningModule):
         #     param.requires_grad = False
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
-        teacher_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
@@ -137,6 +137,7 @@ class E2EpSE(pl.LightningModule):
 
         self.model = DPCCN(**hp.model_args.tse_model)
         self.loss = auraloss.time.SISDRLoss()
+        self.cosine_similarities = []
 
 
     def forward(self, wav, emb=None):
@@ -195,7 +196,7 @@ class E2EpSE(pl.LightningModule):
         
         #condition dccrn on pred_emb
         #convert mix to spec
-      
+        
         out,_ = self.forward(mix, emb = pred_emb) 
 
         min_len = min(out.shape[-1], source.shape[-1])
@@ -423,6 +424,7 @@ class E2EpSE(pl.LightningModule):
         self.test_metrics = SE_metrics(device="cpu")
 
     def test_step(self, batch, batch_idx):
+        breakpoint()
         mix, source, labels = batch  # mix: [B,T], source: [B,2,T]
 
         # --- teacher embeddings from clean sources ---
@@ -436,32 +438,32 @@ class E2EpSE(pl.LightningModule):
             e2 = embs[:, 1, :]
 
             # Evaluate BOTH targets for each mixture
-            # idx = np.random.choice([0, 1])
-            for idx in [0, 1]:
-                emb_tgt = emb1 if idx == 0 else emb2
-                tgt_wav = source[:, idx, :]               # [B,T]
+            idx = np.random.choice([0, 1])
+            # for idx in [0, 1]:
+            emb_tgt = emb1 if idx == 0 else emb2
+            tgt_wav = source[:, idx, :]               # [B,T]
 
-                # pick the mixture-derived embedding closer to emb_tgt
-                cos1 = cosine(e1, emb_tgt)  # [B]
-                cos2 = cosine(e2, emb_tgt)  # [B]
-                scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
+            # pick the mixture-derived embedding closer to emb_tgt
+            cos1 = cosine(e1, emb_tgt)  # [B]
+            cos2 = cosine(e2, emb_tgt)  # [B]
+            scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
 
-                tau = 0.5  # you can anneal this over training
-                w = torch.softmax(scores / tau, dim=1)     # [B,2]
+            tau = 0.5  # you can anneal this over training
+            w = torch.softmax(scores / tau, dim=1)     # [B,2]
 
-                pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
+            pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
 
-                # TasNet forward (list of 3 wavs)
-                out = self.forward(mix, emb=pred_emb)
-                pred = out[0]  # [B, T']
-        
-                # trim to match
-                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
-                pred = pred[..., :min_len]
-                tgt_wav = tgt_wav[..., :min_len]
+            # TasNet forward (list of 3 wavs)
+            out = self.forward(mix, emb=pred_emb)
+            pred = out[0]  # [B, T']
+    
+            # trim to match
+            min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+            pred = pred[..., :min_len]
+            tgt_wav = tgt_wav[..., :min_len]
 
-                # accumulate metrics
-                self.test_metrics.update(pred, tgt_wav)
+            # accumulate metrics
+            self.test_metrics.update(pred, tgt_wav)
 
         return {}
 
@@ -470,6 +472,68 @@ class E2EpSE(pl.LightningModule):
         for k, v in m.items():
             self.log(f"test/{k}", v, prog_bar=True)
         self.test_metrics.reset()
+
+#### Testing out the single speaker case, what does the second embedding encvode?
+    # def test_step(self, batch, batch_idx):
+    #     mix, source, labels = batch  # mix: [B,T], source: [B,2,T]
+    #     breakpoint()
+    #     # --- teacher embeddings from clean sources ---
+    #     with torch.no_grad():
+    #         # --- dual embeddings from mixture (unordered) ---
+    #         embs = self.dual_emb_model(source[:, 0, :])               # [B,2,D]
+    #         e1 = embs[:, 0, :]
+    #         e2 = embs[:, 1, :]
+
+    #         cos_sim = F.cosine_similarity(e1, e2, dim=-1)
+    #         self.cosine_similarities.extend(cos_sim.detach().cpu().numpy().tolist()) # shape: [B]
+
+    #         # Evaluate BOTH targets for each mixture
+    #         # idx = np.random.choice([0, 1])
+
+
+    #         # out1 = self.forward(source[:, 0, :], emb = e1)[0]
+    #         # out2 = self.forward(source[:, 0, :], emb = e2)[0]
+
+
+
+    #         # for idx in [0, 1]:
+    #         #     emb_tgt = emb1 if idx == 0 else emb2
+    #         #     tgt_wav = source[:, idx, :]               # [B,T]
+
+    #         #     # pick the mixture-derived embedding closer to emb_tgt
+    #         #     cos1 = cosine(e1, emb_tgt)  # [B]
+    #         #     cos2 = cosine(e2, emb_tgt)  # [B]
+    #         #     scores = torch.stack([cos1, cos2], dim=1)  # [B,2]
+
+    #         #     tau = 0.5  # you can anneal this over training
+    #         #     w = torch.softmax(scores / tau, dim=1)     # [B,2]
+
+    #         #     pred_emb = w[:, 0:1] * e1 + w[:, 1:2] * e2  # [B, emb_dim]
+
+    #         #     # TasNet forward (list of 3 wavs)
+    #         #     out = self.forward(mix, emb=pred_emb)
+    #         #     pred = out[0]  # [B, T']
+        
+    #         #     # trim to match
+    #         #     min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+    #         #     pred = pred[..., :min_len]
+    #         #     tgt_wav = tgt_wav[..., :min_len]
+
+    #         #     # accumulate metrics
+    #         #     self.test_metrics.update(pred, tgt_wav)
+
+    #     return {}
+
+    # def on_test_epoch_end(self):
+    #     # m = self.test_metrics.compute()
+    #     # for k, v in m.items():
+    #     #     self.log(f"test/{k}", v, prog_bar=True)
+    #     # self.test_metrics.reset()
+    #     cs_array = np.array(self.cosine_similarities)
+    #     avg_cs = np.mean(cs_array)
+    #     std_cs = np.std(cs_array)
+    #     print(f"Average Cosine Similarity between dual embeddings: {avg_cs:.4f} ± {std_cs:.4f}")
+
     # -----------------------------
     # OPTIMIZER + SCHEDULER
     # -----------------------------
@@ -499,15 +563,16 @@ class E2EpSE(pl.LightningModule):
 # MAIN
 # ---------------------------------------
 if __name__ == "__main__":
-    DATA_ROOT = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix" 
-    SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
-    # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix" 
+    SPEAKER_MAP = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    # SPEAKER_MAP = "/home/sidcs/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=2, 
-        num_workers=20, # Set this to your preference
+        batch_size=32, 
+        # num_workers=20, # Set this to your preference
+        num_workers=0,
         num_speakers=2
     )
 
@@ -523,7 +588,7 @@ if __name__ == "__main__":
         name="pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
+        save_dir="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -531,15 +596,15 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
+        dirpath="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
     )
 
     trainer = pl.Trainer(
         strategy="ddp",
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
-        devices=[0, 1, 2, 3],
-        # devices=[0],
+        # devices=[0, 1, 2, 3],
+        devices=[0],
         max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -568,8 +633,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
+    # trainer.fit(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/best-epoch=16-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
-
+    trainer.test(model, datamodule=dm, ckpt_path="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/best-epoch=19-val_separation=0.000.ckpt")
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()

@@ -4,7 +4,7 @@ import torchaudio
 
 
 import sys
-sys.path.append('/home/sidharth./codebase/')
+sys.path.append('/home/sidcs/codebase/')
 from wesep.modules.common.speaker import PreEmphasis
 from wesep.modules.common.speaker import SpeakerFuseLayer
 from wesep.modules.common.speaker import SpeakerTransform
@@ -248,6 +248,7 @@ class DPCCN(nn.Module):
             predict_speaker_lable = self.pred_linear(spk_emb_input)
 
         spk_embedding = self.spk_transform(spk_emb_input)
+      
         spk_embedding = spk_embedding.unsqueeze(1).unsqueeze(3)
 
         out = self.spk_fuse(out.transpose(2, 3), spk_embedding).transpose(2, 3)

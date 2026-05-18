@@ -47,9 +47,9 @@ class MyLibri2Mix(Dataset):
    
         self.noise_prob = 0.8
         if split=='train':
-            self.noise_file_path = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
+            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
         elif split == 'val' or split == 'test':
-            self.noise_file_path = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
+            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
 
         with open(self.noise_file_path, 'r') as f:
             self.noise_dict = json.load(f)
