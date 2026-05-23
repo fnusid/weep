@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-# from torchmetrics.audio import PerceptualEvaluationSpeechQuality
-# from torchmetrics.audio import ShortTimeObjectiveIntelligibility
-# from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
+from torchmetrics.audio import PerceptualEvaluationSpeechQuality
+from torchmetrics.audio import ShortTimeObjectiveIntelligibility
+from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
 # from torchmetrics.audio import DeepNoiseSuppressionMeanOpinionScore
-from torchmetrics.audio.pesq import PerceptualEvaluationSpeechQuality
-from torchmetrics.audio.stoi import ShortTimeObjectiveIntelligibility
-from torchmetrics.audio.sdr import ScaleInvariantSignalDistortionRatio
+# from torchmetrics.audio.pesq import PerceptualEvaluationSpeechQuality
+# from torchmetrics.audio.stoi import ShortTimeObjectiveIntelligibility
+# from torchmetrics.audio.sdr import ScaleInvariantSignalDistortionRatio
 from torchmetrics.audio.dnsmos import DeepNoiseSuppressionMeanOpinionScore
 
 

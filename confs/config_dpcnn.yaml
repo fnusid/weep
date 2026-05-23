@@ -8,7 +8,7 @@ model_args:
     tcn_blocks: 10
     tcn_layers: 2
     spk_emb_dim: 256
-    causal: False
+    causal: True
     spk_fuse_type: 'multiply'
     use_spk_transform: False
     joint_training: False
