@@ -40,19 +40,35 @@ def mix_noise_with_snr(clean, noise, snr_db):
     return clean + scale * noise
 
 class MyLibri2Mix(Dataset):
-    def __init__(self, metadata_path, speaker_map_path, num_speakers=2, sampling_rate=16000, split='train'):
+    def __init__(
+        self,
+        metadata_path,
+        speaker_map_path,
+        num_speakers=2,
+        sampling_rate=16000,
+        split='train',
+        add_online_noise=True,
+        noise_file_path=None,
+    ):
         super().__init__()
 
         self.metadata = pd.read_csv(metadata_path)
-   
-        self.noise_prob = 0.8
-        if split=='train':
-            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
-        elif split == 'val' or split == 'test':
-            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
+        self.sampling_rate = sampling_rate
+        self.add_online_noise = add_online_noise
+        self.noise_prob = 0.8 if add_online_noise else 0.0
+        self.noise_dict = None
+        if self.add_online_noise:
+            if noise_file_path is not None:
+                self.noise_file_path = noise_file_path
+            elif split == 'train':
+                self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
+            elif split == 'val' or split == 'test':
+                self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
+            else:
+                self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
 
-        with open(self.noise_file_path, 'r') as f:
-            self.noise_dict = json.load(f)
+            with open(self.noise_file_path, 'r') as f:
+                self.noise_dict = json.load(f)
 
         
 
@@ -182,7 +198,14 @@ class LibriMixDataModule(pl.LightningDataModule):
                 batch_size=32,
                 num_workers=0,
                 num_speakers=2,
-                sample_rate=16000):
+                sample_rate=16000,
+                train_metadata_path=None,
+                val_metadata_path=None,
+                test_metadata_path=None,
+                add_online_noise=True,
+                train_noise_file_path=None,
+                val_noise_file_path=None,
+                test_noise_file_path=None):
         
         super().__init__()
         self.data_root = data_root
@@ -191,6 +214,13 @@ class LibriMixDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.num_speakers = num_speakers
         self.sampling_rate = sample_rate
+        self.train_metadata_path = train_metadata_path
+        self.val_metadata_path = val_metadata_path
+        self.test_metadata_path = test_metadata_path
+        self.add_online_noise = add_online_noise
+        self.train_noise_file_path = train_noise_file_path
+        self.val_noise_file_path = val_noise_file_path
+        self.test_noise_file_path = test_noise_file_path
 
         self.persistent_workers = True if self.num_workers > 0 else False
 
@@ -203,27 +233,33 @@ class LibriMixDataModule(pl.LightningDataModule):
 
 
 
-        train_meta = os.path.join(self.metadata_path, "mixture_train-360_mix_clean.csv")
-        val_meta = os.path.join(self.metadata_path, "mixture_dev_mix_clean.csv")
-        test_meta = os.path.join(self.metadata_path, "mixture_test_mix_clean.csv")
+        train_meta = self.train_metadata_path or os.path.join(self.metadata_path, "mixture_train-360_mix_clean.csv")
+        val_meta = self.val_metadata_path or os.path.join(self.metadata_path, "mixture_dev_mix_clean.csv")
+        test_meta = self.test_metadata_path or os.path.join(self.metadata_path, "mixture_test_mix_clean.csv")
 
         self.train_dataset = MyLibri2Mix(
             metadata_path=train_meta,
             speaker_map_path=self.speaker_map_path,
             num_speakers=self.num_speakers,
-            split='train'
+            split='train',
+            add_online_noise=self.add_online_noise,
+            noise_file_path=self.train_noise_file_path,
         )
         self.val_dataset = MyLibri2Mix(
             metadata_path=val_meta,
             speaker_map_path=self.speaker_map_path,
             num_speakers=self.num_speakers,
-            split='val'
+            split='val',
+            add_online_noise=self.add_online_noise,
+            noise_file_path=self.val_noise_file_path,
         )
         self.test_dataset = MyLibri2Mix(
             metadata_path=test_meta,
             speaker_map_path=self.speaker_map_path,
             num_speakers=self.num_speakers,
-            split='test'
+            split='test',
+            add_online_noise=self.add_online_noise,
+            noise_file_path=self.test_noise_file_path,
         )
         self.fixed_val_indices = list(range(5))  # first 5 samples
 

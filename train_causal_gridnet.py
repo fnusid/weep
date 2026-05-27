@@ -1,5 +1,6 @@
 import json
 import random
+import argparse
 import warnings
 from pathlib import Path
 
@@ -68,6 +69,8 @@ class E2EpSE(pl.LightningModule):
         lr: float = 1e-4,
         finetune_encoder: bool = False,
         emb_dim: int = 256,
+        slot_repulsion_weight: float = 0.1,
+        slot_repulsion_margin: float = 0.0,
         speaker_map_path: str = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
         model_args: dict | None = None,
     ):
@@ -82,7 +85,11 @@ class E2EpSE(pl.LightningModule):
             emb_dim=emb_dim,
             finetune_wavlm=True,
         )
-        self.dual_emb_loss = LossWraper()
+        self.dual_emb_loss = LossWraper(
+            slot_repulsion_weight=slot_repulsion_weight,
+            slot_repulsion_margin=slot_repulsion_margin,
+            emb_dim=emb_dim,
+        )
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
         teacher_ckpt_path = Path(
@@ -102,6 +109,17 @@ class E2EpSE(pl.LightningModule):
         self.metrics = SE_metrics(device="cpu")
         self.model = CausalGridNet(**self.model_args)
         self.loss = auraloss.time.SISDRLoss()
+
+    def load_compatible_checkpoint(self, ckpt_path: str | Path):
+        ckpt_path = Path(ckpt_path)
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        print(f"[init] loaded compatible weights from {ckpt_path}")
+        if missing:
+            print(f"[init] missing keys ({len(missing)}): {missing}")
+        if unexpected:
+            print(f"[init] unexpected keys ({len(unexpected)}): {unexpected}")
 
     def forward(self, wav, emb=None, input_state=None, pad=True):
         if wav.ndim == 2:
@@ -126,10 +144,27 @@ class E2EpSE(pl.LightningModule):
         return emb1, emb2
 
     def _select_target(self, source, emb1, emb2, deterministic_idx=None):
-        idx = deterministic_idx if deterministic_idx is not None else random.randint(0, 1)
-        if idx == 0:
-            return emb1, source[:, 0, :], emb2, source[:, 1, :]
-        return emb2, source[:, 1, :], emb1, source[:, 0, :]
+        active_mask = source.abs().sum(dim=-1) > 1e-8
+        batch_size = source.shape[0]
+        device = source.device
+
+        if deterministic_idx is not None:
+            if isinstance(deterministic_idx, int):
+                idx = torch.full((batch_size,), deterministic_idx, device=device, dtype=torch.long)
+            else:
+                idx = deterministic_idx.to(device=device, dtype=torch.long)
+        else:
+            idx = torch.randint(0, 2, (batch_size,), device=device)
+            only_spk0 = active_mask[:, 0] & (~active_mask[:, 1])
+            only_spk1 = active_mask[:, 1] & (~active_mask[:, 0])
+            idx = torch.where(only_spk0, torch.zeros_like(idx), idx)
+            idx = torch.where(only_spk1, torch.ones_like(idx), idx)
+
+        target_emb = torch.where(idx.unsqueeze(1) == 0, emb1, emb2)
+        other_emb = torch.where(idx.unsqueeze(1) == 0, emb2, emb1)
+        target_speech = torch.where(idx.unsqueeze(1) == 0, source[:, 0, :], source[:, 1, :])
+        other_speech = torch.where(idx.unsqueeze(1) == 0, source[:, 1, :], source[:, 0, :])
+        return target_emb, target_speech, other_emb, other_speech
 
     def _mixture_conditioning_embedding(self, mix, emb_tgt):
         embs = self.dual_emb_model(mix)
@@ -159,11 +194,18 @@ class E2EpSE(pl.LightningModule):
 
         emb1, emb2 = self._teacher_embeddings(source)
         gt_embs = torch.stack([emb1, emb2], dim=1)
+        silence_mask = source.abs().sum(dim=-1) <= 1e-8
 
         emb_tgt, target_speech, _, _ = self._select_target(source, emb1, emb2)
         embs, pred_emb = self._mixture_conditioning_embedding(mix, emb_tgt)
 
-        loss_emb = self.dual_emb_loss(embs, gt_embs)
+        loss_emb_out = self.dual_emb_loss(
+            embs,
+            gt_embs,
+            silence_mask=silence_mask,
+            return_components=True,
+        )
+        loss_emb = loss_emb_out["loss"]
         estimate = self._run_separator(mix, pred_emb)
         estimate, target_speech = self._trim_pair(estimate, target_speech)
 
@@ -203,6 +245,30 @@ class E2EpSE(pl.LightningModule):
             logger=True,
             batch_size=mix.shape[0],
         )
+        self.log(
+            "train/dual_match_loss",
+            loss_emb_out["match_loss"],
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+            batch_size=mix.shape[0],
+        )
+        self.log(
+            "train/dual_slot_repulsion_loss",
+            loss_emb_out["slot_repulsion_loss"],
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+            batch_size=mix.shape[0],
+        )
+        self.log(
+            "train/dual_silence_proto_norm",
+            loss_emb_out["silence_proto_norm"],
+            on_step=True,
+            on_epoch=True,
+            logger=True,
+            batch_size=mix.shape[0],
+        )
         return loss
 
     def validation_step(self, batch, batch_idx, drift=False):
@@ -234,13 +300,10 @@ class E2EpSE(pl.LightningModule):
         mix = mix.to(self.device)
         src = src.to(self.device)
 
-        idx = random.randint(0, 1)
-        tgt = src[:, idx, :]
-
         with torch.no_grad():
             emb1 = self.single_sp_model(src[:, 0, :])
             emb2 = self.single_sp_model(src[:, 1, :])
-            emb_tgt = emb1 if idx == 0 else emb2
+            emb_tgt, tgt, _, _ = self._select_target(src, emb1, emb2, deterministic_idx=None)
             _, pred_emb = self._mixture_conditioning_embedding(mix, emb_tgt)
             pred = self._run_separator(mix, pred_emb)
 
@@ -261,9 +324,7 @@ class E2EpSE(pl.LightningModule):
 
         with torch.no_grad():
             emb1, emb2 = self._teacher_embeddings(source)
-            idx = np.random.choice([0, 1])
-            emb_tgt = emb1 if idx == 0 else emb2
-            target_speech = source[:, idx, :]
+            emb_tgt, target_speech, _, _ = self._select_target(source, emb1, emb2)
 
             _, pred_emb = self._mixture_conditioning_embedding(mix, emb_tgt)
             pred = self._run_separator(mix, pred_emb)
@@ -301,10 +362,21 @@ class E2EpSE(pl.LightningModule):
         }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--init-from-ckpt", type=str, default=None)
+    parser.add_argument("--resume-ckpt", type=str, default=None)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    cli_args = parse_args()
     DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix"
-    SPEAKER_MAP = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
-    RUN_NAME = "causal_gridnet_joint_training"
+    HARD_PAIR_ROOT = Path("/home/sidcs/datasets/LibriMix/LibriMix/hard_pairs_teacher_centroid")
+    SPEAKER_MAP = str(HARD_PAIR_ROOT / "metadata" / "train_mapping.json")
+    TRAIN_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_train.csv")
+    VAL_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_val.csv")
+    RUN_NAME = "causal_gridnet_joint_training_hardpairs_silence"
     SAVE_DIR = Path(f"/home/sidcs/model_ckpts/{RUN_NAME}")
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -314,15 +386,23 @@ if __name__ == "__main__":
         batch_size=8,
         num_workers=20,
         num_speakers=2,
+        train_metadata_path=TRAIN_META,
+        val_metadata_path=VAL_META,
+        test_metadata_path=VAL_META,
+        add_online_noise=False,
     )
 
     model = E2EpSE(
         lr=1e-4,
         finetune_encoder=False,
         emb_dim=256,
+        slot_repulsion_weight=0.1,
+        slot_repulsion_margin=0.0,
         speaker_map_path=SPEAKER_MAP,
         model_args=CAUSAL_GRIDNET_ARGS,
     )
+    if cli_args.init_from_ckpt:
+        model.load_compatible_checkpoint(cli_args.init_from_ckpt)
 
     wandb_logger = WandbLogger(
         project="causal_gridnet_2sp",
@@ -335,7 +415,7 @@ if __name__ == "__main__":
         monitor="train_loss",
         mode="min",
         save_top_k=-1,
-        filename="epoch{epoch:02d}-trainloss{train_loss:.Vy3f}",
+        filename="epoch{epoch:02d}-trainloss{train_loss:.3f}",
         dirpath=str(SAVE_DIR),
     )
 
@@ -350,6 +430,8 @@ if __name__ == "__main__":
         enable_checkpointing=True,
     )
 
-    # trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm, ckpt_path="/home/sidcs/model_ckpts/causal_gridnet_joint_training/epochepoch=182-trainlosstrain_loss=-4.580.ckpt")
+    if cli_args.resume_ckpt and cli_args.init_from_ckpt:
+        raise ValueError("Use either --resume-ckpt or --init-from-ckpt, not both.")
+
+    trainer.fit(model, datamodule=dm, ckpt_path=cli_args.resume_ckpt)
     wandb.finish()
