@@ -4,7 +4,7 @@ import torchaudio
 
 
 import sys
-sys.path.append('/home/sidharth./codebase/')
+sys.path.append('/home/sidcs/codebase/')
 from wesep.modules.common.speaker import PreEmphasis
 from wesep.modules.common.speaker import SpeakerFuseLayer
 from wesep.modules.common.speaker import SpeakerTransform
