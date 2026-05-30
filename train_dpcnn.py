@@ -137,6 +137,15 @@ class E2EpSE(pl.LightningModule):
 
         self.model = DPCCN(**hp.model_args.tse_model)
         self.loss = auraloss.time.SISDRLoss()
+        self.mr_stft = auraloss.freq.MultiResolutionSTFTLoss(
+                        fft_sizes=[256, 512, 1024],
+                        hop_sizes=[64, 128, 256],
+                        win_lengths=[256, 512, 1024],
+                        scale="mel",
+                        n_bins=128,
+                        sample_rate=16000,
+                        perceptual_weighting=True,
+                    )
         self.cosine_similarities = []
 
 
@@ -203,7 +212,9 @@ class E2EpSE(pl.LightningModule):
         out = out[..., :min_len]
 
         source = target_speech[..., :min_len]
-        loss_tse = self.loss(out, source)   
+        loss_tse = self.loss(out, source)  
+        # loss_mrstft = self.mr_stft(out, source) 
+        # loss_tse = loss_tse + 0.1 * loss_mrstft #Change later 
         # out_wav = self.audio_utils.spec2wav(out.detach().numpy(), mix_phase)
         #adjust weights accordingly
         emb_params = [p for p in self.dual_emb_model.parameters() if p.requires_grad]
