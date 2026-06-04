@@ -86,8 +86,8 @@ class E2EpSE(pl.LightningModule):
             finetune_wavlm=True,
         )
         self.dual_emb_loss = LossWraper(
-            slot_repulsion_weight=slot_repulsion_weight,
-            slot_repulsion_margin=slot_repulsion_margin,
+            slot_repulsion_weight=0,
+            slot_repulsion_margin=0,
             emb_dim=emb_dim,
         )
 
@@ -109,6 +109,14 @@ class E2EpSE(pl.LightningModule):
         self.metrics = SE_metrics(device="cpu")
         self.model = CausalGridNet(**self.model_args)
         self.loss = auraloss.time.SISDRLoss()
+        self.mr_stft = auraloss.freq.MultiResolutionSTFTLoss(
+            fft_sizes=[256, 512, 1024],
+            hop_sizes=[64, 128, 256],
+            win_lengths=[256, 512, 1024],
+            scale=None,
+            sample_rate=16000,
+            perceptual_weighting=False,
+        )
 
     def load_compatible_checkpoint(self, ckpt_path: str | Path):
         ckpt_path = Path(ckpt_path)
@@ -194,7 +202,8 @@ class E2EpSE(pl.LightningModule):
 
         emb1, emb2 = self._teacher_embeddings(source)
         gt_embs = torch.stack([emb1, emb2], dim=1)
-        silence_mask = source.abs().sum(dim=-1) <= 1e-8
+        # silence_mask = source.abs().sum(dim=-1) <= 1e-8
+        silence_mask = None
 
         emb_tgt, target_speech, _, _ = self._select_target(source, emb1, emb2)
         embs, pred_emb = self._mixture_conditioning_embedding(mix, emb_tgt)
@@ -210,6 +219,16 @@ class E2EpSE(pl.LightningModule):
         estimate, target_speech = self._trim_pair(estimate, target_speech)
 
         loss_tse = self.loss(estimate, target_speech)
+
+        if estimate.ndim ==2 and target_speech.ndim == 2:
+
+
+
+            loss_mrstft = self.mr_stft(estimate.unsqueeze(1), target_speech.unsqueeze(1))
+        else:
+            loss_mrstft = self.mr_stft(estimate, target_speech)
+
+        loss_tse = loss_tse + 0.1 * loss_mrstft #change it later if needed the weights
 
         emb_params = [p for p in self.dual_emb_model.parameters() if p.requires_grad]
         grad_tse = torch.autograd.grad(
@@ -233,6 +252,15 @@ class E2EpSE(pl.LightningModule):
             on_step=True,
             on_epoch=True,
             prog_bar=True,
+            logger=True,
+            batch_size=mix.shape[0],
+        )
+        self.log(
+            "train/MRSTFT_loss",
+            loss_mrstft,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True, 
             logger=True,
             batch_size=mix.shape[0],
         )
@@ -372,18 +400,18 @@ def parse_args():
 if __name__ == "__main__":
     cli_args = parse_args()
     DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix"
-    HARD_PAIR_ROOT = Path("/home/sidcs/datasets/LibriMix/LibriMix/hard_pairs_teacher_centroid")
+    HARD_PAIR_ROOT = Path("/home/sidcs/datasets/LibriMix/LibriMix/hard_easy_pairs_teacher_centroid")
     SPEAKER_MAP = str(HARD_PAIR_ROOT / "metadata" / "train_mapping.json")
     TRAIN_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_train.csv")
     VAL_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_val.csv")
-    RUN_NAME = "causal_gridnet_joint_training_hardpairs_silence"
+    RUN_NAME = "causal_gridnet_joint_training_hardeasypairs_mrstft_0.1"
     SAVE_DIR = Path(f"/home/sidcs/model_ckpts/{RUN_NAME}")
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=8,
+        batch_size=16,
         num_workers=20,
         num_speakers=2,
         train_metadata_path=TRAIN_META,
@@ -420,9 +448,10 @@ if __name__ == "__main__":
     )
 
     trainer = pl.Trainer(
-        strategy="ddp",
+        strategy="ddp_find_unused_parameters_true",
         accelerator="gpu",
-        devices=[0,1,2,3,4,5,6,7],
+        devices=[0,1,2,3,4,5,6],
+
         max_epochs=300,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -434,4 +463,6 @@ if __name__ == "__main__":
         raise ValueError("Use either --resume-ckpt or --init-from-ckpt, not both.")
 
     trainer.fit(model, datamodule=dm, ckpt_path=cli_args.resume_ckpt)
+    # trainer.test(model, datamodule=dm)
+    # trainer.fit(model, datamodule=dm, ckpt_path = "/home/sidcs/model_ckpts/causal_gridnet_joint_training_hardpairs_silence_mrstft_0.1/epochepoch=64-trainlosstrain_loss=1.445.ckpt")
     wandb.finish()
