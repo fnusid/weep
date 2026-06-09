@@ -29,6 +29,22 @@ random.seed(42)
 warnings.filterwarnings("ignore")
 
 
+
+def strip_dual_model_weights(state_dict):
+    new_state = {}
+    for key, value in state_dict.items():
+        if not key.startswith("model."):
+            continue
+
+        trimmed = key[len("model."):]
+
+        if trimmed.startswith("single_sp_model.") or trimmed.startswith("arcface_loss."):
+            continue
+
+        new_state[trimmed] = value
+
+    return new_state
+
 CAUSAL_GRIDNET_ARGS = {
     "spk_emb_dim": 256,
     "stft_chunk_size": 128,
@@ -36,13 +52,14 @@ CAUSAL_GRIDNET_ARGS = {
     "stft_back_pad": 128,
     "num_ch": 1,
     "D": 64,
-    "L": 0,
+    "L": 4,
     "I": 1,
     "J": 1,
     "B": 3,
     "H": 64,
     "local_atten_len": 50,
-    "use_attn": False,
+    "use_attn": True,
+    "masked_attn": True, 
     "chunk_causal": True,
     "spectral_masking": True,
 }
@@ -69,8 +86,6 @@ class E2EpSE(pl.LightningModule):
         lr: float = 1e-4,
         finetune_encoder: bool = False,
         emb_dim: int = 256,
-        slot_repulsion_weight: float = 0.1,
-        slot_repulsion_margin: float = 0.0,
         speaker_map_path: str = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
         model_args: dict | None = None,
     ):
@@ -85,11 +100,21 @@ class E2EpSE(pl.LightningModule):
             emb_dim=emb_dim,
             finetune_wavlm=True,
         )
+        # self.dual_emb_loss = LossWraper(
+        #     slot_repulsion_weight=0,
+        #     slot_repulsion_margin=0,
+        #     emb_dim=emb_dim,
+        # )
         self.dual_emb_loss = LossWraper(
-            slot_repulsion_weight=0,
-            slot_repulsion_margin=0,
             emb_dim=emb_dim,
         )
+
+        dual_ckpt_path = Path("/home/sidcs/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt")
+        ckpt_dual = torch.load(dual_ckpt_path, map_location="cpu")["state_dict"]
+        emb_state = strip_dual_model_weights(ckpt_dual)
+        self.dual_emb_model.load_state_dict(emb_state, strict=True)
+        print("[load] base dual-embedding keys:", len(emb_state))
+        
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
         teacher_ckpt_path = Path(
@@ -198,12 +223,11 @@ class E2EpSE(pl.LightningModule):
         return pred[..., :min_len], target[..., :min_len]
 
     def training_step(self, batch, batch_idx):
+        # breakpoint()
         mix, source, _ = batch
 
         emb1, emb2 = self._teacher_embeddings(source)
         gt_embs = torch.stack([emb1, emb2], dim=1)
-        # silence_mask = source.abs().sum(dim=-1) <= 1e-8
-        silence_mask = None
 
         emb_tgt, target_speech, _, _ = self._select_target(source, emb1, emb2)
         embs, pred_emb = self._mixture_conditioning_embedding(mix, emb_tgt)
@@ -211,10 +235,8 @@ class E2EpSE(pl.LightningModule):
         loss_emb_out = self.dual_emb_loss(
             embs,
             gt_embs,
-            silence_mask=silence_mask,
-            return_components=True,
         )
-        loss_emb = loss_emb_out["loss"]
+        loss_emb = loss_emb_out
         estimate = self._run_separator(mix, pred_emb)
         estimate, target_speech = self._trim_pair(estimate, target_speech)
 
@@ -274,26 +296,11 @@ class E2EpSE(pl.LightningModule):
             batch_size=mix.shape[0],
         )
         self.log(
-            "train/dual_match_loss",
-            loss_emb_out["match_loss"],
+            "train/embedding_loss",
+            loss_emb,
             on_step=True,
             on_epoch=True,
-            logger=True,
-            batch_size=mix.shape[0],
-        )
-        self.log(
-            "train/dual_slot_repulsion_loss",
-            loss_emb_out["slot_repulsion_loss"],
-            on_step=True,
-            on_epoch=True,
-            logger=True,
-            batch_size=mix.shape[0],
-        )
-        self.log(
-            "train/dual_silence_proto_norm",
-            loss_emb_out["silence_proto_norm"],
-            on_step=True,
-            on_epoch=True,
+            prog_bar=True, 
             logger=True,
             batch_size=mix.shape[0],
         )
@@ -400,32 +407,33 @@ def parse_args():
 if __name__ == "__main__":
     cli_args = parse_args()
     DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix"
-    HARD_PAIR_ROOT = Path("/home/sidcs/datasets/LibriMix/LibriMix/hard_easy_pairs_teacher_centroid")
-    SPEAKER_MAP = str(HARD_PAIR_ROOT / "metadata" / "train_mapping.json")
-    TRAIN_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_train.csv")
-    VAL_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_val.csv")
-    RUN_NAME = "causal_gridnet_joint_training_hardeasypairs_mrstft_0.1"
+    #HARD_PAIR_ROOT = Path("/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min")
+    
+    # SPEAKER_MAP = str(HARD_PAIR_ROOT / "metadata" / "train_mapping.json")
+    SPEAKER_MAP = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    # TRAIN_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_train.csv")
+    # VAL_META = str(HARD_PAIR_ROOT / "metadata" / "mixture_val.csv")
+    # RUN_NAME = "causal_gridnet_2sp_use_attn_True_noslotshit_hardeasypairs_mrstft_0.1"
+    RUN_NAME = "causal_gridnet_2sp_use_attn_True_mrstft_0.1_libri05_08"
     SAVE_DIR = Path(f"/home/sidcs/model_ckpts/{RUN_NAME}")
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=16,
+        batch_size=8,
         num_workers=20,
         num_speakers=2,
-        train_metadata_path=TRAIN_META,
-        val_metadata_path=VAL_META,
-        test_metadata_path=VAL_META,
-        add_online_noise=False,
+        # train_metadata_path=TRAIN_META,
+        # val_metadata_path=VAL_META,
+        # test_metadata_path=VAL_META,
+      
     )
 
     model = E2EpSE(
         lr=1e-4,
         finetune_encoder=False,
         emb_dim=256,
-        slot_repulsion_weight=0.1,
-        slot_repulsion_margin=0.0,
         speaker_map_path=SPEAKER_MAP,
         model_args=CAUSAL_GRIDNET_ARGS,
     )
@@ -433,7 +441,7 @@ if __name__ == "__main__":
         model.load_compatible_checkpoint(cli_args.init_from_ckpt)
 
     wandb_logger = WandbLogger(
-        project="causal_gridnet_2sp",
+        project="causal_gridnet_2sp_use_attn_True_mrstft_0",
         name=RUN_NAME,
         log_model=False,
         save_dir=str(SAVE_DIR / "wandb_logs"),
@@ -450,10 +458,13 @@ if __name__ == "__main__":
     trainer = pl.Trainer(
         strategy="ddp_find_unused_parameters_true",
         accelerator="gpu",
-        devices=[0,1,2,3,4,5,6],
+        devices=[1,2,3,4,5,6],
+        # devices=[0],
 
         max_epochs=300,
         logger=wandb_logger,
+        # logger=None,
+
         callbacks=[ckpt],
         gradient_clip_val=5.0,
         enable_checkpointing=True,
@@ -462,7 +473,8 @@ if __name__ == "__main__":
     if cli_args.resume_ckpt and cli_args.init_from_ckpt:
         raise ValueError("Use either --resume-ckpt or --init-from-ckpt, not both.")
 
-    trainer.fit(model, datamodule=dm, ckpt_path=cli_args.resume_ckpt)
+    # trainer.fit(model, datamodule=dm, ckpt_path=cli_args.resume_ckpt)
+    trainer.fit(model, datamodule=dm, ckpt_path="/home/sidcs/model_ckpts/causal_gridnet_2sp_use_attn_True_mrstft_0.1_libri05_08/epochepoch=87-trainlosstrain_loss=-4.352.ckpt")
     # trainer.test(model, datamodule=dm)
     # trainer.fit(model, datamodule=dm, ckpt_path = "/home/sidcs/model_ckpts/causal_gridnet_joint_training_hardpairs_silence_mrstft_0.1/epochepoch=64-trainlosstrain_loss=1.445.ckpt")
     wandb.finish()
