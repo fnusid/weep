@@ -1,0 +1,9 @@
+{
+  "num_examples": 10,
+  "mean_mixture_si_sdr": -0.13572392985224724,
+  "mean_full_si_sdr": 2.251100677996874,
+  "mean_full_si_sdri": 2.386824607849121,
+  "mean_prompt_si_sdr": 3.655169252306223,
+  "mean_prompt_si_sdri": 3.79089318215847,
+  "results_csv": "/home/sidcs/codebase/wesep/eval_runs/prompt15_vs_full_dpccn_libri05_08style/per_sample_results.csv"
+}

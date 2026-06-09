@@ -15,7 +15,7 @@ from models.dpcnn import DPCCN #TSE
 from metrics import SE_metrics
 import wandb
 import sys
-sys.path.append("/home/sidharth./codebase/")
+sys.path.append("/home/sidcs/codebase/")
 
 from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper
 from wavlm_dual_embedding.model import SpeakerEncoderDualWrapper 
@@ -30,7 +30,7 @@ import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidharth./codebase/wesep/confs/config_dpcnn.yaml")
+config_path = Path("/home/sidcs/codebase/wesep/confs/config_dpcnn.yaml")
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -97,7 +97,7 @@ class E2EpSE(pl.LightningModule):
    
         #Get the dual-emb model and teacher model
         
-        dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
+        dual_emb_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
         # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
         dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
         state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
@@ -110,7 +110,7 @@ class E2EpSE(pl.LightningModule):
         #     param.requires_grad = False
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
-        teacher_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
@@ -506,15 +506,15 @@ class E2EpSE(pl.LightningModule):
 # MAIN
 # ---------------------------------------
 if __name__ == "__main__":
-    DATA_ROOT = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix" 
-    SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix" 
+    SPEAKER_MAP = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
     # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=2, 
-        num_workers=0, # Set this to your preference
+        batch_size=32, 
+        num_workers=20, # Set this to your preference
         num_speakers=2
     )
 
@@ -530,7 +530,7 @@ if __name__ == "__main__":
         name="pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
+        save_dir="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -538,15 +538,15 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
+        dirpath="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
     )
 
     trainer = pl.Trainer(
         strategy="ddp",
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
-        # devices=[0, 1, 2, 3],
-        devices=[0],
+        devices=[ 1, 2, 3],
+        # devices=[0],
         max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -575,8 +575,8 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
-    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
+    # trainer.fit(model, datamodule=dm)
+    trainer.test(model, datamodule=dm, ckpt_path="/home/sidcs/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
