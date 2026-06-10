@@ -30,7 +30,7 @@ def parse_args():
             "and enhancement is run on the remaining suffix."
         )
     )
-    ap.add_argument("--model", choices=["dpccn"], required=True)
+    ap.add_argument("--model", choices=["dpccn", "gridnet"], required=True)
     ap.add_argument("--tse-ckpt", type=Path, required=True)
     ap.add_argument("--embedding-ckpt", type=Path, default=None)
     ap.add_argument("--teacher-ckpt", type=Path, default=DEFAULT_TEACHER_CKPT)
@@ -82,6 +82,23 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     an = a.norm(dim=-1) + 1e-8
     bn = b.norm(dim=-1) + 1e-8
     return dot / (an * bn)
+
+
+def select_conditioning_embedding(model_name: str, e1: torch.Tensor, e2: torch.Tensor, teacher_target: torch.Tensor):
+    c1 = cosine(e1, teacher_target)
+    c2 = cosine(e2, teacher_target)
+    if model_name == "dpccn":
+        choose = (c1 > c2).unsqueeze(-1)
+        pred_emb = torch.where(choose, e1, e2)
+        selected_slot = 1 if bool(choose.item()) else 2
+    elif model_name == "gridnet":
+        scores = torch.stack([c1, c2], dim=1)
+        weights = torch.softmax(scores / 0.5, dim=1)
+        pred_emb = weights[:, 0:1] * e1 + weights[:, 1:2] * e2
+        selected_slot = 1 if c1.item() > c2.item() else 2
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+    return pred_emb, c1, c2, selected_slot
 
 
 def format_summary_table(summary: dict) -> str:
@@ -163,10 +180,9 @@ def main():
 
         prompt_e1 = prompt_embeddings[:, 0, :]
         prompt_e2 = prompt_embeddings[:, 1, :]
-        prompt_c1 = cosine(prompt_e1, teacher_target)
-        prompt_c2 = cosine(prompt_e2, teacher_target)
-        prompt_choose = (prompt_c1 > prompt_c2).unsqueeze(-1)
-        prompt_emb = torch.where(prompt_choose, prompt_e1, prompt_e2)
+        prompt_emb, prompt_c1, prompt_c2, prompt_selected_slot = select_conditioning_embedding(
+            args.model, prompt_e1, prompt_e2, teacher_target
+        )
 
         prompt_pred = enhance_full_or_chunked(
             model_name=args.model,
@@ -184,10 +200,9 @@ def main():
 
         full_e1 = full_embeddings[:, 0, :]
         full_e2 = full_embeddings[:, 1, :]
-        full_c1 = cosine(full_e1, teacher_target)
-        full_c2 = cosine(full_e2, teacher_target)
-        full_choose = (full_c1 > full_c2).unsqueeze(-1)
-        full_emb = torch.where(full_choose, full_e1, full_e2)
+        full_emb, full_c1, full_c2, full_selected_slot = select_conditioning_embedding(
+            args.model, full_e1, full_e2, teacher_target
+        )
 
         full_pred = enhance_full_or_chunked(
             model_name=args.model,
@@ -229,12 +244,12 @@ def main():
                 "mixture_si_sdr": mixture_score,
                 "prompt_cos1": float(prompt_c1.item()),
                 "prompt_cos2": float(prompt_c2.item()),
-                "prompt_selected_slot": 1 if bool(prompt_choose.item()) else 2,
+                "prompt_selected_slot": prompt_selected_slot,
                 "prompt_si_sdr": prompt_score,
                 "prompt_si_sdri": prompt_improvement,
                 "full_cos1": float(full_c1.item()),
                 "full_cos2": float(full_c2.item()),
-                "full_selected_slot": 1 if bool(full_choose.item()) else 2,
+                "full_selected_slot": full_selected_slot,
                 "full_si_sdr": full_score,
                 "full_si_sdri": full_improvement,
             }

@@ -25,15 +25,34 @@ DEFAULT_CONFIGS = {
     "dpccn": REPO_ROOT / "confs" / "config_dpcnn.yaml",
 }
 
+CAUSAL_GRIDNET_ARGS = {
+    "spk_emb_dim": 256,
+    "stft_chunk_size": 128,
+    "stft_pad_size": 128,
+    "stft_back_pad": 128,
+    "num_ch": 1,
+    "D": 64,
+    "L": 4,
+    "I": 1,
+    "J": 1,
+    "B": 3,
+    "H": 64,
+    "local_atten_len": 50,
+    "use_attn": True,
+    "masked_attn": True,
+    "chunk_causal": True,
+    "spectral_masking": True,
+}
+
 
 def parse_args():
     ap = argparse.ArgumentParser(
         description=(
             "Run two-speaker TSE inference on one recording using a wesep "
-            "DPCCN enhancer plus a dual-embedding model."
+            "enhancer plus a dual-embedding model."
         )
     )
-    ap.add_argument("--model", choices=["dpccn"], required=True)
+    ap.add_argument("--model", choices=["dpccn", "gridnet"], required=True)
     ap.add_argument("--tse-ckpt", type=Path, required=True)
     ap.add_argument(
         "--embedding-ckpt",
@@ -49,8 +68,9 @@ def parse_args():
         type=Path,
         default=None,
         help=(
-            "Optional architecture config. This should be a YAML with "
-            "`model_args.tse_model` for DPCCN."
+            "Optional architecture config. For DPCCN, this should be a YAML with "
+            "`model_args.tse_model`. For causal GridNet, JSON/YAML kwargs may be "
+            "provided; otherwise built-in causal defaults are used."
         ),
     )
     ap.add_argument("--input", type=Path, required=True)
@@ -98,6 +118,15 @@ def parse_args():
         action="store_true",
         help="Enable fp16 autocast on CUDA for the enhancer forward pass.",
     )
+    ap.add_argument(
+        "--gridnet-local-atten-len",
+        type=int,
+        default=None,
+        help=(
+            "Override causal GridNet local attention length at inference time. "
+            "Only used when --model gridnet."
+        ),
+    )
     return ap.parse_args()
 
 
@@ -105,6 +134,18 @@ def load_yaml_config(config_path: Path):
     with config_path.open("r", encoding="utf-8") as f:
         docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
     return OmegaConf.merge(*docs)
+
+
+def load_generic_mapping(config_path: Path):
+    if config_path.suffix.lower() == ".json":
+        import json
+
+        with config_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
+    with config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data
 
 
 def load_audio_mono(path: Path, target_sr: int) -> torch.Tensor:
@@ -181,16 +222,38 @@ def pick_best_candidate(model, candidates, strict_preference=True):
     return best
 
 
-def build_tse_model(model_name: str, config_path: Path):
+def build_tse_model(model_name: str, config_path: Path, overrides: dict | None = None):
     if model_name == "dpccn":
         hp = load_yaml_config(config_path)
         model_args = hp.model_args.tse_model
         return DPCCN(**model_args)
+    if model_name == "gridnet":
+        from models.gridnet_causal_net import Net as CausalGridNet
+
+        if config_path is None:
+            model_args = dict(CAUSAL_GRIDNET_ARGS)
+        else:
+            loaded = load_generic_mapping(config_path)
+            if loaded is None:
+                model_args = dict(CAUSAL_GRIDNET_ARGS)
+            elif "model_args" in loaded and "tse_model" in loaded["model_args"]:
+                model_args = dict(loaded["model_args"]["tse_model"])
+            else:
+                model_args = dict(loaded)
+        if overrides:
+            model_args.update(overrides)
+        return CausalGridNet(**model_args)
     raise ValueError(f"Unsupported model: {model_name}")
 
 
-def load_tse_model(model_name: str, config_path: Path, ckpt_path: Path, device: torch.device):
-    model = build_tse_model(model_name, config_path)
+def load_tse_model(
+    model_name: str,
+    config_path: Path,
+    ckpt_path: Path,
+    device: torch.device,
+    overrides: dict | None = None,
+):
+    model = build_tse_model(model_name, config_path, overrides=overrides)
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
     state_dict = get_state_dict(ckpt)
 
@@ -208,6 +271,14 @@ def load_tse_model(model_name: str, config_path: Path, ckpt_path: Path, device: 
 
 
 def run_separator(model_name: str, enhancer, noisy_bt: torch.Tensor, emb: torch.Tensor):
+    if model_name == "gridnet":
+        mixture_bt = noisy_bt.unsqueeze(1).contiguous()
+        emb = emb.contiguous()
+        outputs = enhancer({"mixture": mixture_bt, "embedding": emb}, input_state=None, pad=True)
+        estimate = outputs["output"]
+        if estimate.ndim == 3 and estimate.shape[1] == 1:
+            estimate = estimate[:, 0]
+        return estimate
     return unwrap_enhancer_output(enhancer(noisy_bt, emb))
 
 
@@ -366,12 +437,24 @@ def main():
         requested_device = "cpu"
     device = torch.device(requested_device)
 
+    gridnet_overrides = {}
+    if args.model == "gridnet" and args.gridnet_local_atten_len is not None:
+        gridnet_overrides["local_atten_len"] = args.gridnet_local_atten_len
+
     print(f"[info] loading config: {config_path}")
-    tse_model, tse_load = load_tse_model(args.model, config_path, args.tse_ckpt, device)
+    tse_model, tse_load = load_tse_model(
+        args.model,
+        config_path,
+        args.tse_ckpt,
+        device,
+        overrides=gridnet_overrides or None,
+    )
     print(
         f"[info] loaded {args.model} checkpoint via {tse_load['label']} "
         f"(missing={len(tse_load['missing'])}, unexpected={len(tse_load['unexpected'])})"
     )
+    if gridnet_overrides:
+        print(f"[info] applied gridnet overrides: {gridnet_overrides}")
 
     emb_model, emb_load = load_embedding_model(args.embedding_ckpt, args.tse_ckpt, args.emb_dim, device)
     print(

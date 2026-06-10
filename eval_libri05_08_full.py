@@ -35,7 +35,7 @@ def parse_args():
             "mixture embedding the same way the repo's test path does."
         )
     )
-    ap.add_argument("--model", choices=["dpccn"], required=True)
+    ap.add_argument("--model", choices=["dpccn", "gridnet"], required=True)
     ap.add_argument("--tse-ckpt", type=Path, required=True)
     ap.add_argument("--embedding-ckpt", type=Path, default=None)
     ap.add_argument("--teacher-ckpt", type=Path, default=DEFAULT_TEACHER_CKPT)
@@ -47,6 +47,15 @@ def parse_args():
     ap.add_argument("--chunk-threshold-sec", type=float, default=20.0)
     ap.add_argument("--chunk-sec", type=float, default=8.0)
     ap.add_argument("--hop-sec", type=float, default=4.0)
+    ap.add_argument(
+        "--gridnet-local-atten-len",
+        type=int,
+        default=None,
+        help=(
+            "Override causal GridNet local attention length at inference time. "
+            "Only used when --model gridnet."
+        ),
+    )
     ap.add_argument("--autocast-fp16", action="store_true")
     ap.add_argument("--save-audio", action="store_true")
     ap.add_argument(
@@ -121,6 +130,19 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return dot / (an * bn)
 
 
+def select_conditioning_embedding(model_name: str, e1: torch.Tensor, e2: torch.Tensor, teacher_target: torch.Tensor) -> torch.Tensor:
+    cos1 = cosine(e1, teacher_target)
+    cos2 = cosine(e2, teacher_target)
+    if model_name == "dpccn":
+        choose_mask = (cos1 > cos2).unsqueeze(-1)
+        return torch.where(choose_mask, e1, e2)
+    if model_name == "gridnet":
+        scores = torch.stack([cos1, cos2], dim=1)
+        weights = torch.softmax(scores / 0.5, dim=1)
+        return weights[:, 0:1] * e1 + weights[:, 1:2] * e2
+    raise ValueError(f"Unsupported model: {model_name}")
+
+
 def si_sdr(est: torch.Tensor, ref: torch.Tensor) -> float:
     est = est.float()
     ref = ref.float()
@@ -159,6 +181,9 @@ def main():
         print("[warn] CUDA requested but unavailable; falling back to CPU.")
         requested_device = "cpu"
     device = torch.device(requested_device)
+    gridnet_overrides = {}
+    if args.model == "gridnet" and args.gridnet_local_atten_len is not None:
+        gridnet_overrides["local_atten_len"] = args.gridnet_local_atten_len
 
     metadata = normalize_mixboth_metadata(pd.read_csv(args.metadata_csv))
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -167,13 +192,21 @@ def main():
     if args.model in DEFAULT_CONFIGS:
         config_path = config_path or DEFAULT_CONFIGS[args.model]
 
-    tse_model, tse_info = load_tse_model(args.model, config_path, args.tse_ckpt, device)
+    tse_model, tse_info = load_tse_model(
+        args.model,
+        config_path,
+        args.tse_ckpt,
+        device,
+        overrides=gridnet_overrides or None,
+    )
     emb_model, emb_info = load_embedding_model(args.embedding_ckpt, args.tse_ckpt, args.emb_dim, device)
     teacher = load_teacher_model(args.teacher_ckpt, args.emb_dim, device)
     print(
         f"[info] loaded separator via {tse_info['label']}; "
         f"embedding via {emb_info['label']}; teacher from {args.teacher_ckpt}"
     )
+    if gridnet_overrides:
+        print(f"[info] applied gridnet overrides: {gridnet_overrides}")
 
     rows = []
     mix_scores = []
@@ -208,10 +241,7 @@ def main():
             teacher_target = teacher_emb1 if target_idx == 0 else teacher_emb2
             target_wav = source1 if target_idx == 0 else source2
 
-            cos1 = cosine(e1, teacher_target)
-            cos2 = cosine(e2, teacher_target)
-            choose_mask = (cos1 > cos2).unsqueeze(-1)
-            pred_emb = torch.where(choose_mask, e1, e2)
+            pred_emb = select_conditioning_embedding(args.model, e1, e2, teacher_target)
 
             enhanced = enhance_full_or_chunked(
                 model_name=args.model,

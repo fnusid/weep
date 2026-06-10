@@ -1,0 +1,9 @@
+{
+  "num_examples": 10,
+  "mean_mixture_si_sdr": -0.13572392985224724,
+  "mean_full_si_sdr": -0.3208774719387293,
+  "mean_full_si_sdri": -0.18515354208648205,
+  "mean_prompt_si_sdr": 0.9971215017139912,
+  "mean_prompt_si_sdri": 1.1328454315662384,
+  "results_csv": "/home/sidcs/codebase/wesep/eval_runs/prompt15_vs_full_causal_gridnet_libri05_08style/per_sample_results.csv"
+}

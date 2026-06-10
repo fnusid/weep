@@ -1,0 +1,8 @@
+{
+  "num_examples": 6000,
+  "target_mode": "both",
+  "mean_mixture_si_sdr": -1.9035200372381222,
+  "mean_full_si_sdr": 6.323293640025659,
+  "mean_full_si_sdri": 8.226813677263781,
+  "results_csv": "/home/sidcs/codebase/wesep/eval_runs/libri05_08_full_causal_gridnet_joint/per_sample_results.csv"
+}
