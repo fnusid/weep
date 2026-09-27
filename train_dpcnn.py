@@ -9,13 +9,15 @@ import matplotlib.pyplot as plt
 from pytorch_lightning.loggers import WandbLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
-from dataset.dataloader import LibriMixDataModule       
+import sys
+sys.path.append("/home/sidcs.csegpu1/codebase/")
+# parent of this repo, so the internal `wesep.*` imports resolve
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dataset.dataloader import LibriMixDataModule
 from models.dpcnn import DPCCN #TSE
 
 from metrics import SE_metrics
 import wandb
-import sys
-sys.path.append("/home/sidharth./codebase/")
 
 from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper
 from wavlm_dual_embedding.model import SpeakerEncoderDualWrapper 
@@ -24,13 +26,16 @@ import random
 random.seed(42)
 import warnings
 warnings.filterwarnings("ignore")
-
+from torchmetrics.audio import ScaleInvariantSignalDistortionRatio
+from torchmetrics.functional.audio import (
+    scale_invariant_signal_distortion_ratio as si_sdr,
+)
 import auraloss
 import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidharth./codebase/wesep/confs/config_dpcnn.yaml")
+config_path = Path(__file__).resolve().parent / "confs" / "config_dpcnn.yaml"
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -38,6 +43,11 @@ with config_path.open("r", encoding="utf-8") as f:
 hp = OmegaConf.merge(*docs)
 
 import numpy as np
+
+
+import pickle
+# with open("/home/sidcs.csegpu1/codebase/wavlm_dual_embedding/cached_embeddings.pkl", "rb") as f:
+#     CACHED_EMBS = pickle.load(f)
 
 def norm(grads):
     # grads can contain None if allow_unused=True
@@ -86,7 +96,7 @@ class E2EpSE(pl.LightningModule):
         lr: float = 1e-4,
         finetune_encoder: bool = False,
         emb_dim: int = 256,
-        speaker_map_path: str = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
+        speaker_map_path: str = "/home/sidcs.csegpu1/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -97,20 +107,23 @@ class E2EpSE(pl.LightningModule):
    
         #Get the dual-emb model and teacher model
         
-        dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
+        dual_emb_ckpt_path = "/home/sidcs.csegpu1/model_ckpts/librispeech_asp_ft_wavlm_linear_dualemb_tr360/best-epoch=49-val_separation=0.000.ckpt"
         # dual_emb_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_3spft_wavlm_linear_dualemb_tr360/best-epoch=54-val_separation=0.000.ckpt"
         dual_emb_ckpt = torch.load(dual_emb_ckpt_path, map_location=device)
         state = strip_dual_model_weights(dual_emb_ckpt["state_dict"])
         self.dual_emb_model = SpeakerEncoderDualWrapper(emb_dim=emb_dim, finetune_wavlm=True) #joint training 
         self.dual_emb_model.load_state_dict(state, strict=True)
         self.dual_emb_loss = LossWraper()
+        self.num_mixtures = 0
+        self.num_both_assigned = 0
+
 
         # self.dual_emb_model.to(device).eval()
         # for param in self.dual_emb_model.parameters():
         #     param.requires_grad = False
 
         self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
-        teacher_ckpt_path = "/mnt/disks/data/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path = "/home/sidcs.csegpu1/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
@@ -121,7 +134,9 @@ class E2EpSE(pl.LightningModule):
                 filtered[k.replace("model.", "", 1)] = v
 
         print("Loaded teacher keys:", len(filtered))
-
+        self.wav_pit = "True"
+        self.use_cached_embs = "False"
+        self.sisdr_metric = ScaleInvariantSignalDistortionRatio().to(device)
         self.single_sp_model.load_state_dict(filtered, strict=True)
         self.single_sp_model.eval()
         for param in self.single_sp_model.parameters():
@@ -433,8 +448,68 @@ class E2EpSE(pl.LightningModule):
         # Separate accumulator so test doesn't mix with val
         self.test_metrics = SE_metrics(device="cpu")
 
+    def _build_cached_emb_index(self):
+        """Flatten CACHED_EMBS ({stem_id: {"embs": [...], "labels": [...]}})
+        into parallel arrays once, for fast distractor sampling."""
+        all_embs, all_labels = [], []
+        for stem_id, d in CACHED_EMBS.items():
+            for emb, lab in zip(d["embs"], d["labels"]):
+                all_embs.append(emb)
+                all_labels.append(lab)
+        self._cached_embs_arr = np.stack(all_embs, axis=0)     # [N, D]
+        self._cached_labels_arr = np.array(all_labels)         # [N]
+
+    def sample_distractor_embs(self, labels):
+        """
+        labels: [B, 2]
+        Returns: [B, 2, D], one embedding pair per donor mixture.
+        Both donor speakers must be absent from the current mixture.
+        """
+        labels_np = (
+            labels.detach().cpu().numpy()
+            if torch.is_tensor(labels)
+            else np.asarray(labels)
+        )
+
+        pairs = []
+
+        for item_labels in labels_np:
+            present = set(item_labels.tolist())
+
+            eligible = [
+                d for d in CACHED_EMBS.values()
+                if len(d["embs"]) == 2
+                and len(d["labels"]) == 2
+                and len(set(d["labels"])) == 2
+                and present.isdisjoint(set(d["labels"]))
+            ]
+
+            if not eligible:
+                raise ValueError(
+                    f"No eligible donor mixture for speakers {present}"
+                )
+
+            donor = random.choice(eligible)
+
+            pair = torch.stack([
+                torch.as_tensor(
+                    emb, dtype=torch.float32, device=self.device
+                ).detach()
+                for emb in donor["embs"]
+            ])  # [2, D]
+
+            pairs.append(pair)
+
+        return torch.stack(pairs)  # [B, 2, D]
+
     def test_step(self, batch, batch_idx):
+
         mix, source, labels = batch  # mix: [B,T], source: [B,2,T]
+
+        # Sample a distractor embedding per batch item, drawn from CACHED_EMBS,
+        # from a speaker NOT present in that item's mixture (labels[i]).
+        # distractor_embs = self.sample_distractor_embs(labels)  # [B, D]
+        distractor_embs = None
 
         # --- teacher embeddings from clean sources ---
         with torch.no_grad():
@@ -448,31 +523,128 @@ class E2EpSE(pl.LightningModule):
 
             # Evaluate BOTH targets for each mixture
             # idx = np.random.choice([0, 1])
-            for idx in [0, 1]:
-                emb_tgt = emb1 if idx == 0 else emb2
-                tgt_wav = source[:, idx, :]               # [B,T]
+            tgt1 = source[:, 0, :]  # [B,T]
+            tgt2 = source[:, 1, :]  # [B,T]
 
-                # pick the mixture-derived embedding closer to emb_tgt
-                c1 = cosine(e1, emb_tgt)
-                c2 = cosine(e2, emb_tgt)
-                choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
-                pred_emb = torch.where(choose_mask, e1, e2)
+            if self.use_cached_embs =="True":
+                # Generate BOTH outputs using student embeddings.
+                dist_e1 = distractor_embs[:, 0, :]
+                dist_e2 = distractor_embs[:, 1, :]
+                out1 = self.forward(mix, emb=dist_e1)[0]
+                out2 = self.forward(mix, emb=dist_e2)[0]
 
-                # TasNet forward (list of 3 wavs)
-                out = self.forward(mix, emb=pred_emb)
-                pred = out[0]  # [B, T']
-        
-                # trim to match
-                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
-                pred = pred[..., :min_len]
-                tgt_wav = tgt_wav[..., :min_len]
 
-                # accumulate metrics
-                self.test_metrics.update(pred, tgt_wav)
+                min_len = min(
+                    out1.shape[-1], out2.shape[-1],
+                    tgt1.shape[-1], tgt2.shape[-1],
+                )
+                out1 = out1[..., :min_len]
+                out2 = out2[..., :min_len]
+                tgt1 = tgt1[..., :min_len]
+                tgt2 = tgt2[..., :min_len]
 
-        return {}
+                # Per-example scores [B], not batch-averaged scalars.
+                # Match zero_mean to your existing SI-SDR metric's setting.
+                s11 = si_sdr(out1.float(), tgt1.float(), zero_mean=False)
+                s12 = si_sdr(out1.float(), tgt2.float(), zero_mean=False)
+                s21 = si_sdr(out2.float(), tgt1.float(), zero_mean=False)
+                s22 = si_sdr(out2.float(), tgt2.float(), zero_mean=False)
+
+                # One-to-one waveform PIT, separately for each mixture.
+                swap = ((s12 + s21) > (s11 + s22)).unsqueeze(-1)  # [B,1]
+
+                matched_tgt1 = torch.where(swap, tgt2, tgt1)
+                matched_tgt2 = torch.where(swap, tgt1, tgt2)
+
+                self.test_metrics.update(out1, matched_tgt1)
+                self.test_metrics.update(out2, matched_tgt2)
+
+                # Independent matching ONLY for coverage diagnostics.
+                # Ties consistently select reference 1.
+                out1_prefers_tgt2 = s12 > s11
+                out2_prefers_tgt2 = s22 > s21
+                both_assigned = out1_prefers_tgt2 != out2_prefers_tgt2
+
+                self.num_both_assigned += both_assigned.sum().item()
+                self.num_mixtures += mix.shape[0]
+            if self.wav_pit == 'True':
+                # Generate BOTH outputs using student embeddings.
+                # out1 = self.forward(mix, emb=e1)[0]
+                # out2 = self.forward(mix, emb=e2)[0]
+
+                #Generate Both outputs using teacher embeddings
+                out1 = self.forward(mix, emb=emb1)[0]
+                out2 = self.forward(mix, emb=emb2)[0]
+
+                min_len = min(
+                    out1.shape[-1], out2.shape[-1],
+                    tgt1.shape[-1], tgt2.shape[-1],
+                )
+                out1 = out1[..., :min_len]
+                out2 = out2[..., :min_len]
+                tgt1 = tgt1[..., :min_len]
+                tgt2 = tgt2[..., :min_len]
+
+                # Per-example scores [B], not batch-averaged scalars.
+                # Match zero_mean to your existing SI-SDR metric's setting.
+                s11 = si_sdr(out1.float(), tgt1.float(), zero_mean=False)
+                s12 = si_sdr(out1.float(), tgt2.float(), zero_mean=False)
+                s21 = si_sdr(out2.float(), tgt1.float(), zero_mean=False)
+                s22 = si_sdr(out2.float(), tgt2.float(), zero_mean=False)
+
+                # One-to-one waveform PIT, separately for each mixture.
+                swap = ((s12 + s21) > (s11 + s22)).unsqueeze(-1)  # [B,1]
+
+                matched_tgt1 = torch.where(swap, tgt2, tgt1)
+                matched_tgt2 = torch.where(swap, tgt1, tgt2)
+
+                self.test_metrics.update(out1, matched_tgt1)
+                self.test_metrics.update(out2, matched_tgt2)
+
+                # Independent matching ONLY for coverage diagnostics.
+                # Ties consistently select reference 1.
+                out1_prefers_tgt2 = s12 > s11
+                out2_prefers_tgt2 = s22 > s21
+                both_assigned = out1_prefers_tgt2 != out2_prefers_tgt2
+
+                self.num_both_assigned += both_assigned.sum().item()
+                self.num_mixtures += mix.shape[0]
+                
+            else:
+
+                for idx in [0, 1]:
+                    emb_tgt = emb1 if idx == 0 else emb2
+                    tgt_wav = source[:, idx, :]               # [B,T]
+
+                    # pick the mixture-derived embedding closer to emb_tgt
+                    c1 = cosine(e1, emb_tgt)
+                    c2 = cosine(e2, emb_tgt)
+                    choose_mask = (c1 > c2).unsqueeze(-1)     # [B,1]
+                    pred_emb = torch.where(choose_mask, e1, e2)
+
+                    # TasNet forward (list of 3 wavs)
+                    out = self.forward(mix, emb=pred_emb)
+                    pred = out[0]  # [B, T']
+            
+                    # trim to match
+                    min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                    pred = pred[..., :min_len]
+                    tgt_wav = tgt_wav[..., :min_len]
+
+                    # accumulate metrics
+                    self.test_metrics.update(pred, tgt_wav)
+
+            return {}
 
     def on_test_epoch_end(self):
+        #print the coverage tensor
+        #print the coverage tensor as a percentage of gt count
+        if self.num_mixtures > 0:
+            both_rate = self.num_both_assigned / self.num_mixtures
+
+            print("Both-speaker assignment rate:", both_rate)
+            print("Duplicate-assignment rate:", 1.0 - both_rate)
+            print("Mean assignment coverage:", 0.5 + 0.5 * both_rate)
         m = self.test_metrics.compute()
         for k, v in m.items():
             self.log(f"test/{k}", v, prog_bar=True)
@@ -506,15 +678,15 @@ class E2EpSE(pl.LightningModule):
 # MAIN
 # ---------------------------------------
 if __name__ == "__main__":
-    DATA_ROOT = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix" 
-    SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    DATA_ROOT = "/home/sidcs.csegpu1/datasets/LibriMix/LibriMix" 
+    SPEAKER_MAP = "/home/sidcs.csegpu1/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
     # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=2, 
-        num_workers=0, # Set this to your preference
+        batch_size=32, 
+        num_workers=20, # Set this to your preference
         num_speakers=2
     )
 
@@ -530,7 +702,7 @@ if __name__ == "__main__":
         name="pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
+        save_dir="/home/sidcs.csegpu1/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -538,15 +710,15 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
+        dirpath="/home/sidcs.csegpu1/model_ckpts/pDCCRN_2sp_dpccn_joint_training_freezewavlm_indloss/"
     )
 
     trainer = pl.Trainer(
         strategy="ddp",
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
-        # devices=[0, 1, 2, 3],
-        devices=[0],
+        devices=[1, 3, 5],
+        # devices=[0],
         max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -575,7 +747,9 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    trainer.fit(model, datamodule=dm)
+    # trainer.fit(model, datamodule=dm)
+    model.strict_loading=False
+    trainer.test(model, datamodule=dm, ckpt_path="/home/sidcs.csegpu1/model_ckpts/pDCCRN_2sp_teacher_emb/best-epoch=199-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
 
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
