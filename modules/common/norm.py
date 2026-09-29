@@ -2,7 +2,7 @@ import numbers
 
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 class GlobalChannelLayerNorm(nn.Module):
     """
@@ -116,6 +116,8 @@ class FiLM(nn.Module):
             nn.init.zeros_(self.beta_fcs[i].bias)
 
     def forward(self, embed, x):
+        #Normalize the emebdding 
+        embed = F.normalize(embed, p=2, dim=-1)
         gamma, beta = None, None
         for i in range(len(self.gamma_fcs)):
             if i == 0:

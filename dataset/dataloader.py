@@ -10,6 +10,18 @@ import os
 import pytorch_lightning as pl
 from torch.nn.utils.rnn import pad_sequence
 
+# Turbo mount set up by the sbatch scripts. Metadata CSVs and noise JSONs store absolute
+# paths from the machines they were generated on; rebase those onto this root.
+DATASETS_ROOT = "/tmp/sidcs/turbo/sidcs_backup/datasets"
+OLD_DATASETS_ROOTS = ("/home/sidcs/datasets", "/home/sidcs.csegpu1/datasets")
+
+
+def rebase_path(p):
+    for old in OLD_DATASETS_ROOTS:
+        if p.startswith(old + "/"):
+            return DATASETS_ROOT + p[len(old):]
+    return p
+
 
 def mix_noise_with_snr(clean, noise, snr_db):
     """
@@ -44,15 +56,18 @@ class MyLibri2Mix(Dataset):
         super().__init__()
 
         self.metadata = pd.read_csv(metadata_path)
+        for i in range(num_speakers):
+            self.metadata[f"source_{i+1}_path"] = self.metadata[f"source_{i+1}_path"].map(rebase_path)
+        self.metadata["mixture_path"] = self.metadata["mixture_path"].map(rebase_path)
    
         self.noise_prob = 0.8
         if split=='train':
-            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
+            self.noise_file_path = f"{DATASETS_ROOT}/LibriMix/LibriMix/noise_files_embedding_model/freesound_noise_bins.json" #[freesound, sound-bible, wham tr]
         elif split == 'val' or split == 'test':
-            self.noise_file_path = "/home/sidcs/datasets/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
+            self.noise_file_path = f"{DATASETS_ROOT}/LibriMix/LibriMix/noise_files_embedding_model/wham_tt_noise_bins.json"
 
         with open(self.noise_file_path, 'r') as f:
-            self.noise_dict = json.load(f)
+            self.noise_dict = {k: [rebase_path(p) for p in v] for k, v in json.load(f).items()}
 
         
 

@@ -11,13 +11,15 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 from dataset.dataloader import LibriMixDataModule       
 from models.dpcnn import DPCCN #TSE
-
+import sys
+sys.path.append("/home/sidcs/")
 from metrics import SE_metrics
 import wandb
-import sys
-sys.path.append("/home/sidcs/codebase/")
 
-from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper
+# sys.path.append("/home/sidcs/")
+
+# from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
+from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
 import random
 random.seed(42)
 import warnings
@@ -28,7 +30,7 @@ import yaml
 from pathlib import Path
 from omegaconf import OmegaConf
 
-config_path = Path("/home/sidcs/codebase/wesep/confs/config_dpcnn.yaml")
+config_path = Path("/home/sidcs/wesep/confs/config_dpcnn.yaml")
 
 with config_path.open("r", encoding="utf-8") as f:
     docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
@@ -62,15 +64,17 @@ class E2EpSE(pl.LightningModule):
         lr: float = 1e-4,
         finetune_encoder: bool = False,
         emb_dim: int = 256,
-        speaker_map_path: str = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
+        speaker_map_path: str = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
     ):
         super().__init__()
         self.save_hyperparameters()
         with open(speaker_map_path, "r") as f:
             speaker_map = json.load(f)
 
-        self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)
-        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        # self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
+        self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
+        # teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
@@ -253,7 +257,7 @@ class E2EpSE(pl.LightningModule):
         # 1) Compute validation metrics
         m = self.metrics.compute()
         for k, v in m.items():
-            self.log(f"val/{k}", v, prog_bar=True)
+            self.log(f"val/{k}", v, prog_bar=True, sync_dist=True)
         self.metrics.reset()
 
         # 2) Log audio samples (5 fixed samples)
@@ -335,7 +339,7 @@ class E2EpSE(pl.LightningModule):
     def on_test_epoch_end(self):
         m = self.test_metrics.compute()
         for k, v in m.items():
-            self.log(f"test/{k}", v, prog_bar=True)
+            self.log(f"test/{k}", v, prog_bar=True, sync_dist=True)
         self.test_metrics.reset()
     # -----------------------------
     # OPTIMIZER + SCHEDULER
@@ -366,15 +370,20 @@ class E2EpSE(pl.LightningModule):
 # MAIN
 # ---------------------------------------
 if __name__ == "__main__":
-    DATA_ROOT = "/home/sidcs/datasets/LibriMix/LibriMix" 
-    SPEAKER_MAP = "/home/sidcs/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    # One DDP process per SLURM task (one GPU each); fall back to 1 when run outside SLURM
+    NUM_GPUS = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+    NUM_NODES = int(os.environ.get("SLURM_JOB_NUM_NODES", 1))
+    CPUS_PER_TASK = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
+
+    DATA_ROOT = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix" 
+    SPEAKER_MAP = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
     # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
 
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
         batch_size=8, 
-        num_workers=20, # Set this to your preference
+        num_workers=CPUS_PER_TASK - 1,  # per GPU process; leave one core for the main process
         num_speakers=2
     )
 
@@ -390,7 +399,7 @@ if __name__ == "__main__":
         name="pDCCRN_2sp_teacher_emb",
         # name='test_run',
         log_model=False,
-        save_dir="/mnt/disks/data/model_ckpts/pDCCRN_2sp_teacher_emb/wandb_logs",
+        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -398,7 +407,8 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/home/sidcs/model_ckpts/pDCCRN_2sp_teacher_emb/"
+        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/",
+        save_last=True,  # last.ckpt lets a resubmitted job resume after the time limit
     )
 
     trainer = pl.Trainer(
@@ -406,7 +416,9 @@ if __name__ == "__main__":
         accelerator="gpu",
         # precision="16-mixed",    # <-- mixed precision
         # devices=[0, 1, 2, 3],
-        devices=[0,1,2,3,4,5,6,7],
+        # devices=[0,1,2,3,4,5,6,7],
+        devices=NUM_GPUS,
+        num_nodes=NUM_NODES,
         max_epochs=200,
         logger=wandb_logger,
         callbacks=[ckpt],
@@ -435,9 +447,11 @@ if __name__ == "__main__":
     #     limit_val_batches=1,
     #     num_sanity_val_steps=0,
     # )
-    # trainer.fit(model, datamodule=dm)
-    trainer.test(model, datamodule=dm, ckpt_path="/home/sidcs/model_ckpts/pDCCRN_2sp_teacher_emb/best-epoch=199-val_separation=0.000.ckpt")
+    # resumes from last.ckpt in the checkpoint dir if present, otherwise starts fresh
+    # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
+    # trainer.fit(model, datamodule=dm, ckpt_path="last")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=29-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
-
+    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
