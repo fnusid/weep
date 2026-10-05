@@ -12,7 +12,7 @@ from wesep.modules.dpcnn.convs import Conv2dBlock
 from wesep.modules.dpcnn.convs import ConvTrans2dBlock
 from wesep.modules.dpcnn.convs import DenseBlock
 from wesep.modules.dpcnn.convs import TCNBlock
-
+import torch.nn.functional as F
 
 class DPCCN(nn.Module):
 
@@ -248,6 +248,7 @@ class DPCCN(nn.Module):
             predict_speaker_lable = self.pred_linear(spk_emb_input)
 
         spk_embedding = self.spk_transform(spk_emb_input)
+        spk_embedding = torch.nn.functional.normalize(spk_embedding, p=2, dim=-1) 
         spk_embedding = spk_embedding.unsqueeze(1).unsqueeze(3)
 
         out = self.spk_fuse(out.transpose(2, 3), spk_embedding).transpose(2, 3)

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -115,6 +116,8 @@ class E2EpSE(pl.LightningModule):
     # -----------------------------
     # TRAINING
     # -----------------------------
+    def on_train_epoch_start(self):
+        self.single_sp_model.eval()
     def training_step(self, batch, batch_idx):
         """
         batch: (wav, speaker_label)
@@ -366,6 +369,40 @@ class E2EpSE(pl.LightningModule):
         }
 
 
+def _fmt_time(sec):
+    sec = int(sec)
+    return f"{sec // 3600:d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+class LogProgress(pl.Callback):
+    """Plain-text progress for SLURM log files (the Rich bar doesn't render without a TTY)."""
+
+    def __init__(self, every_n_steps=100):
+        self.every_n_steps = every_n_steps
+
+    def on_train_start(self, trainer, pl_module):
+        self.fit_start = time.time()
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.epoch_start = time.time()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not trainer.is_global_zero or (batch_idx + 1) % self.every_n_steps:
+            return
+        done, total = batch_idx + 1, trainer.num_training_batches
+        elapsed = time.time() - self.epoch_start
+        eta = elapsed / done * (total - done)
+        loss = outputs["loss"].item() if isinstance(outputs, dict) else float("nan")
+        print(f"epoch {trainer.current_epoch} | step {done}/{total} | "
+              f"{done / elapsed:.2f} it/s | elapsed {_fmt_time(elapsed)} | "
+              f"epoch ETA {_fmt_time(eta)} | loss {loss:.4f}", flush=True)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            print(f"epoch {trainer.current_epoch} done in {_fmt_time(time.time() - self.epoch_start)} | "
+                  f"total {_fmt_time(time.time() - self.fit_start)}", flush=True)
+
+
 # ---------------------------------------
 # MAIN
 # ---------------------------------------
@@ -382,7 +419,7 @@ if __name__ == "__main__":
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
-        batch_size=8, 
+        batch_size=16, 
         num_workers=CPUS_PER_TASK - 1,  # per GPU process; leave one core for the main process
         num_speakers=2
     )
@@ -395,11 +432,11 @@ if __name__ == "__main__":
     )
 
     wandb_logger = WandbLogger(
-        project="pDCCRN_2sp_teacher_emb",
-        name="pDCCRN_2sp_teacher_emb",
+        project="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
+        name="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
         # name='test_run',
         log_model=False,
-        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/wandb_logs",
+        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -407,7 +444,7 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/",
+        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/",
         save_last=True,  # last.ckpt lets a resubmitted job resume after the time limit
     )
 
@@ -421,7 +458,8 @@ if __name__ == "__main__":
         num_nodes=NUM_NODES,
         max_epochs=200,
         logger=wandb_logger,
-        callbacks=[ckpt],
+        callbacks=[ckpt, LogProgress(every_n_steps=100)],
+        enable_progress_bar=False,  # Rich bar is blank in SLURM logs; LogProgress prints instead
         gradient_clip_val=5.0,
         enable_checkpointing=True,
         
@@ -450,8 +488,9 @@ if __name__ == "__main__":
     # resumes from last.ckpt in the checkpoint dir if present, otherwise starts fresh
     # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.fit(model, datamodule=dm, ckpt_path="last")
+    # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=35-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=29-val_separation=0.000.ckpt")
-    # trainer.test(model, datamodule=dm, ckpt_path="/mnt/disks/data/model_ckpts/pDCCRN_2sp_dpccn/best-epoch=21-val_separation=0.000.ckpt")
-    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
+    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
