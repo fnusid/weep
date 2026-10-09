@@ -1,0 +1,562 @@
+import os
+import json
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+import matplotlib.pyplot as plt
+
+from pytorch_lightning.loggers import WandbLogger
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+# from dataset.dataloader import LibriMixDataModule      
+from dataset.dataset_6sp import LibriMixDataModule 
+from models.dpcnn import DPCCN #TSE
+import sys
+sys.path.append("/home/sidcs/")
+from metrics import SE_metrics
+import wandb
+
+# sys.path.append("/home/sidcs/")
+
+# from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
+from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
+import random
+random.seed(42)
+import warnings
+warnings.filterwarnings("ignore")
+
+import auraloss
+import yaml
+from pathlib import Path
+from omegaconf import OmegaConf
+
+config_path = Path("/home/sidcs/wesep/confs/config_dpcnn.yaml")
+
+with config_path.open("r", encoding="utf-8") as f:
+    docs = [OmegaConf.create(d) for d in yaml.safe_load_all(f)]
+
+hp = OmegaConf.merge(*docs)
+
+import numpy as np
+
+def norm(grads):
+    # grads can contain None if allow_unused=True
+    s = 0.0
+    for g in grads:
+        if g is None: 
+            continue
+        s = s + (g.detach()**2).sum()
+    return torch.sqrt(s + 1e-12)
+
+def strip_model_prefix(state):
+    new_state = {}
+    for k, v in state.items():
+        if k.startswith("model."):
+            new_state[k[len("model."):]] = v   # remove "model."
+        else:
+            new_state[k] = v
+    return new_state
+
+
+class E2EpSE(pl.LightningModule):
+    def __init__(
+        self,
+        lr: float = 1e-4,
+        finetune_encoder: bool = False,
+        emb_dim: int = 256,
+        speaker_map_path: str = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json",
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        with open(speaker_map_path, "r") as f:
+            speaker_map = json.load(f)
+
+        # self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
+        self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
+        # teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
+        ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
+        state = ckpt["state_dict"]
+
+        filtered = {}
+        for k, v in state.items():
+            # only keep model.encoder.* or model.wavlm.*, model.projector.*, model.pooling.*
+            if k.startswith("model.") and ("arcface" not in k):
+                filtered[k.replace("model.", "", 1)] = v
+
+        print("Loaded teacher keys:", len(filtered))
+
+        self.single_sp_model.load_state_dict(filtered, strict=True)
+        self.single_sp_model.eval()
+        for param in self.single_sp_model.parameters():
+            param.requires_grad = False
+
+
+
+        # -----------------------------
+        # 3. Embedding metrics (for validation)
+        # -----------------------------
+        self.metrics = SE_metrics(device="cpu")  # will overwrite device at runtime
+        # self.metrics = SE_metrics(device='cuda', use_only_sisdr=True)
+
+        self.model = DPCCN(**hp.model_args.tse_model)
+        self.loss = auraloss.time.SISDRLoss()
+
+
+    def forward(self, wav, emb=None):
+        """
+        wav: [B, T] (or [B, 1, T])
+        returns: [B, T] or ([B, 1, T])
+        """
+        if wav.ndim== 3:
+            wav = wav.squeeze(1)  # [B, T]
+        return self.model(wav, emb)
+
+    # -----------------------------
+    # TRAINING
+    # -----------------------------
+    def on_train_epoch_start(self):
+        self.single_sp_model.eval()
+    def training_step(self, batch, batch_idx):
+        """
+        batch: (wav, speaker_label)
+          wav: [B, T]
+          labels: [B, 2]  (speaker IDs, already mapped to [0..num_classes-1])
+        """
+        mix, source, labels = batch
+        with torch.no_grad():
+            emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
+            emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+        
+        randomly_chosen_source = random.randint(0,1) #0, or 1
+        if randomly_chosen_source == 0:
+            emb_tgt = emb1 #[B, emb_dim]
+            target_speech = source[:, 0, :]
+        else:
+            emb_tgt = emb2
+            target_speech = source[:, 1, :] #[B, T]
+
+        out,_ = self.forward(mix, emb=emb_tgt)
+
+        min_len = min(out.shape[-1], source.shape[-1])
+        out = out[..., :min_len]
+
+        source = target_speech[..., :min_len]
+        loss_tse = self.loss(out, source)
+        loss = loss_tse
+
+
+        self.log(
+            "train/SI-SDR_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=mix.shape[0],
+        )
+        return loss
+
+    # -----------------------------
+    # VALIDATION (per-batch)
+    # -----------------------------
+
+
+    def validation_step(self, batch, batch_idx, drift=False):
+        """
+        For now we just compute arcface loss as a simple val loss.
+        The clustering metrics are done in validation_epoch_end
+        on the entire validation set.
+        """
+        mix, source, labels = batch
+        with torch.no_grad():
+            emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
+            emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+        
+        randomly_chosen_source = random.randint(0,1) #0, or 1
+        if randomly_chosen_source == 0:
+            emb_tgt = emb1 #[B, emb_dim]
+            other_emb_tgt = emb2
+            #true
+            target_speech = source[:, 0, :]
+            other_speech = source[:, 1, :]
+            #reversed
+            # emb_tgt = emb2
+
+        else:
+            emb_tgt = emb2
+            other_emb_tgt = emb1
+            #true
+            target_speech = source[:, 1, :] #[B, T]
+            other_speech = source[:, 0, :]
+            #reversed
+            # emb_tgt = emb1
+        if drift != True:
+            out,_ = self.forward(mix, emb=emb_tgt) #list of three wavs
+        # out = out[0]
+        else:
+            combinations = [[1,0],[0.75, 0.25], [0.5,0.5], [0.25,0.75],[0,1]]
+            metrics = {}
+            # metrics[i for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']] = []
+            # for i in ['PESQ','STOI','SI_SDR','SIG','BAK','OVRL']:
+            for i in ['SI_SDR']:
+                metrics[i] = []
+            # breakpoint()
+            for comb in combinations:
+                weight1 = comb[0]
+                weight2 = comb[1]
+                drifted_emb = weight1 * emb_tgt + weight2 * other_emb_tgt
+                out,_ = self.forward(mix, emb = drifted_emb) #list of three wavs
+                min_len = min(out.shape[-1], source.shape[-1])
+                out = out[..., :min_len]
+                target_speech = target_speech[..., :min_len]
+                other_speech = other_speech[..., :min_len]
+                self.metrics.update(out, target_speech)
+                met1 = self.metrics.compute()
+                self.metrics.reset()
+                self.metrics.update(out, other_speech)
+                met2 = self.metrics.compute()
+                self.metrics.reset()
+                for k in metrics.keys():
+                    metrics[k].append((met1[k], met2[k]))
+
+                '''
+                return {
+                "PESQ": float(torch.tensor(self.pesq_scores).nanmean()),
+                "STOI": float(torch.tensor(self.stoi_scores).nanmean()),
+                "SI_SDR": float(torch.tensor(self.sisdr_scores).nanmean()),
+                "SIG": float(torch.tensor(self.SIG).nanmean()),
+                "BAK": float(torch.tensor(self.BAK).nanmean()),
+                "OVRL": float(torch.tensor(self.OVRL).nanmean()),
+                }
+                '''
+            return metrics
+
+
+        
+
+        min_len = min(out.shape[-1], source.shape[-1])
+        out = out[..., :min_len]
+        source = target_speech[..., :min_len]
+        #compute validation metrics #PESQ, DNSMOS metrics
+
+        '''
+        metrics = {
+            "PESQ": float(torch.tensor(self.pesq_scores).nanmean()),
+            "STOI": float(torch.tensor(self.stoi_scores).nanmean()),
+            "SI_SDR": float(torch.tensor(self.sisdr_scores).nanmean()),
+            "SIG": float(torch.tensor(self.SIG).nanmean()),
+            "BAK": float(torch.tensor(self.BAK).nanmean()),
+            "OVRL": float(torch.tensor(self.OVRL).nanmean()),
+        '''
+        self.metrics.update(out, source)
+        return {}
+
+    # -----------------------------
+    # VALIDATION (end of epoch)
+    # -----------------------------
+    def on_validation_epoch_end(self):
+        # 1) Compute validation metrics
+        m = self.metrics.compute()
+        for k, v in m.items():
+            self.log(f"val/{k}", v, prog_bar=True, sync_dist=True)
+        self.metrics.reset()
+
+        # 2) Log audio samples (5 fixed samples)
+        if not hasattr(self, "fixed_val_batch"):
+            # Save a fixed batch on first val step
+            mix, src, _ = next(iter(self.trainer.datamodule.val_dataloader()))
+            self.fixed_val_batch = (mix[:5], src[:5])
+
+        mix, src = self.fixed_val_batch
+        mix = mix.to(self.device)
+        src = src.to(self.device)
+
+        # Determine GT target for logging
+        idx = random.randint(0,1)
+        tgt = src[:, idx, :]   # always log speaker 0 for visualization
+
+        # Run forward pass
+        with torch.no_grad():
+            emb1 = self.single_sp_model(src[:, 0, :])
+            emb2 = self.single_sp_model(src[:, 1, :])
+            if idx == 0:
+                emb_tgt = emb1
+            else:
+                emb_tgt = emb2
+            pred,_ = self.forward(mix, emb=emb_tgt)  # list of three wavs
+            # pred = pred[0]
+
+
+        # Match lengths
+        min_len = min(pred.shape[-1], tgt.shape[-1])
+        pred = pred[..., :min_len]
+        tgt = tgt[..., :min_len]
+        mix = mix[..., :min_len]
+
+        # Log each sample
+        for i in range(mix.shape[0]):
+            m_np = mix[i].detach().cpu().numpy().astype("float32")
+            t_np = tgt[i].detach().cpu().numpy().astype("float32")
+            p_np = pred[i].detach().cpu().numpy().astype("float32")
+
+     
+            run = self.logger.experiment
+
+            run.log({f"audio/mix_{i}":  wandb.Audio(m_np, sample_rate=16000)})
+            run.log({f"audio/tgt_{i}":  wandb.Audio(t_np, sample_rate=16000)})
+            run.log({f"audio/pred_{i}": wandb.Audio(p_np, sample_rate=16000)})
+
+
+    def on_test_start(self):
+        # Separate accumulator so test doesn't mix with val
+        self.test_metrics = SE_metrics(device="cpu")
+
+    def test_step(self, batch, batch_idx):
+        mix, source, labels = batch  # mix: [B,T], source: [B,6,T]
+
+        # --- teacher embeddings from clean sources ---
+        with torch.no_grad():
+            embs = []
+            for src_cnt in range(source.shape[1]):
+                # emb1 = self.single_sp_model(source[:, 0, :])  # [B,D]
+                # emb2 = self.single_sp_model(source[:, 1, :])  # [B,D]
+                emb = self.single_sp_model(source[:, src_cnt, :])
+                embs.append(emb)
+
+            # Evaluate BOTH targets for each mixture
+            # for idx in [0, 1]:
+            #     emb_tgt = emb1 if idx == 0 else emb2
+                # tgt_wav = source[:, idx, :]               # [B,T]
+
+                # out,_ = self.forward(mix, emb=emb_tgt)
+                # pred = out  # [B, T']
+        
+                # # trim to match
+                # min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                # pred = pred[..., :min_len]
+                # tgt_wav = tgt_wav[..., :min_len]
+
+                # # accumulate metrics
+                # self.test_metrics.update(pred, tgt_wav)
+            for idx in range(source.shape[1]):
+                emb_tgt = embs[idx]
+                tgt_wav = source[:, idx, :]               # [B,T]
+
+                out,_ = self.forward(mix, emb=emb_tgt)
+                pred = out  # [B, T']
+        
+                # trim to match
+                min_len = min(pred.shape[-1], tgt_wav.shape[-1])
+                pred = pred[..., :min_len]
+                tgt_wav = tgt_wav[..., :min_len]
+
+                # accumulate metrics
+                self.test_metrics.update(pred, tgt_wav)
+
+        return {}
+
+    def on_test_epoch_end(self):
+        m = self.test_metrics.compute()
+        for k, v in m.items():
+            self.log(f"test/{k}", v, prog_bar=True, sync_dist=True)
+        self.test_metrics.reset()
+    # -----------------------------
+    # OPTIMIZER + SCHEDULER
+    # -----------------------------
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=0.01)
+        # return optimizer
+
+        # monitor one of the embedding metrics, e.g., separation (higher is better)
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="min", 
+            factor=0.5,
+            patience=3,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "train/SI-SDR_loss",
+                "interval": "epoch",
+            },
+        }
+
+
+def _fmt_time(sec):
+    sec = int(sec)
+    return f"{sec // 3600:d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+
+class LogProgress(pl.Callback):
+    """Plain-text progress for SLURM log files (the Rich bar doesn't render without a TTY)."""
+
+    def __init__(self, every_n_steps=100, eval_every_n_steps=10, eval_every_n_sec=60):
+        self.every_n_steps = every_n_steps
+        self.eval_every_n_steps = eval_every_n_steps
+        self.eval_every_n_sec = eval_every_n_sec  # also print when batches are slow
+
+    @staticmethod
+    def _progress(done, total, start):
+        elapsed = time.time() - start
+        eta = elapsed / done * (total - done)
+        return (f"step {done}/{total} | {done / elapsed:.2f} it/s | "
+                f"elapsed {_fmt_time(elapsed)} | ETA {_fmt_time(eta)}")
+
+    def on_train_start(self, trainer, pl_module):
+        self.fit_start = time.time()
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.epoch_start = time.time()
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not trainer.is_global_zero or (batch_idx + 1) % self.every_n_steps:
+            return
+        loss = outputs["loss"].item() if isinstance(outputs, dict) else float("nan")
+        print(f"epoch {trainer.current_epoch} | "
+              f"{self._progress(batch_idx + 1, trainer.num_training_batches, self.epoch_start)} | "
+              f"loss {loss:.4f}", flush=True)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            print(f"epoch {trainer.current_epoch} done in {_fmt_time(time.time() - self.epoch_start)} | "
+                  f"total {_fmt_time(time.time() - self.fit_start)}", flush=True)
+
+    # ---- validation / test (counts are per rank: each GPU gets 1/N of the batches) ----
+    def _eval_batch_end(self, trainer, stage, total, batch_idx):
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        done = batch_idx + 1
+        slow = time.time() - self.last_print >= self.eval_every_n_sec
+        if done % self.eval_every_n_steps and done not in (1, total) and not slow:
+            return
+        self.last_print = time.time()
+        print(f"{stage} | {self._progress(done, total, self.eval_start)}", flush=True)
+
+    def _eval_start(self, trainer, stage, total):
+        self.eval_start = self.last_print = time.time()
+        if trainer.is_global_zero and not trainer.sanity_checking:
+            print(f"{stage} started | {total} batches per rank", flush=True)
+
+    def _eval_end(self, trainer, stage):
+        if trainer.is_global_zero and not trainer.sanity_checking:
+            print(f"{stage} done in {_fmt_time(time.time() - self.eval_start)}", flush=True)
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        self._eval_start(trainer, "val", sum(trainer.num_val_batches))
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        self._eval_batch_end(trainer, "val", trainer.num_val_batches[dataloader_idx], batch_idx)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self._eval_end(trainer, "val")
+
+    def on_test_epoch_start(self, trainer, pl_module):
+        self._eval_start(trainer, "test", sum(trainer.num_test_batches))
+
+    def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        self._eval_batch_end(trainer, "test", trainer.num_test_batches[dataloader_idx], batch_idx)
+
+    def on_test_epoch_end(self, trainer, pl_module):
+        self._eval_end(trainer, "test")
+
+
+# ---------------------------------------
+# MAIN
+# ---------------------------------------
+if __name__ == "__main__":
+    # One DDP process per SLURM task (one GPU each); fall back to 1 when run outside SLURM
+    NUM_GPUS = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
+    NUM_NODES = int(os.environ.get("SLURM_JOB_NUM_NODES", 1))
+    CPUS_PER_TASK = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
+
+    DATA_ROOT = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix" 
+    SPEAKER_MAP = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+    # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
+
+    # dm = LibriMixDataModule(
+    #     data_root=DATA_ROOT,
+    #     speaker_map_path=SPEAKER_MAP,
+    #     batch_size=16, 
+    #     num_workers=CPUS_PER_TASK - 1,  # per GPU process; leave one core for the main process
+    #     num_speakers=2
+    # )
+
+
+    dm = LibriMixDataModule(DATA_ROOT, SPEAKER_MAP, batch_size=16, num_workers=CPUS_PER_TASK - 1)
+  
+    model = E2EpSE(
+        lr=1e-4,
+        finetune_encoder=False,
+        emb_dim=256,
+        speaker_map_path=SPEAKER_MAP,   # ONLY train map here
+    )
+
+    wandb_logger = WandbLogger(
+        project="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
+        name="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
+        # name='test_run',
+        log_model=False,
+        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/wandb_logs",
+    )
+
+    ckpt = pl.callbacks.ModelCheckpoint(
+        monitor="train/SI-SDR_loss",
+        mode="min",
+        save_top_k=-1,
+        filename="best-{epoch}-{val_separation:.3f}",
+        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/",
+        save_last=True,  # last.ckpt lets a resubmitted job resume after the time limit
+    )
+
+    trainer = pl.Trainer(
+        strategy="ddp",
+        accelerator="gpu",
+        # precision="16-mixed",    # <-- mixed precision
+        # devices=[0, 1, 2, 3],
+        # devices=[0,1,2,3,4,5,6,7],
+        devices=NUM_GPUS,
+        num_nodes=NUM_NODES,
+        max_epochs=200,
+        logger=wandb_logger,
+        callbacks=[ckpt, LogProgress(every_n_steps=100)],
+        enable_progress_bar=False,  # Rich bar is blank in SLURM logs; LogProgress prints instead
+        gradient_clip_val=5.0,
+        enable_checkpointing=True,
+        
+    )
+
+    # trainer = pl.Trainer(
+    #     accelerator='gpu',
+    #     devices=[0],
+    #     max_epochs=100,
+    #     logger=wandb_logger,
+    #     overfit_batches=1,
+    #     limit_train_batches=1,
+    #     limit_val_batches=1,
+    #     num_sanity_val_steps=0,
+    #     enable_checkpointing=False,
+    # )
+
+    # trainer = pl.Trainer(
+    #     accelerator="gpu",
+    #     devices=1,
+    #     max_epochs=1,
+    #     limit_train_batches=1,
+    #     limit_val_batches=1,
+    #     num_sanity_val_steps=0,
+    # )
+    # resumes from last.ckpt in the checkpoint dir if present, otherwise starts fresh
+    # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
+    # trainer.fit(model, datamodule=dm, ckpt_path="last")
+    # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=35-val_separation=0.000.ckpt")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=29-val_separation=0.000.ckpt")
+    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
+    # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
+    wandb.finish()
