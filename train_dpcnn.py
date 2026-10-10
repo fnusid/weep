@@ -19,8 +19,8 @@ import wandb
 
 # sys.path.append("/home/sidcs/")
 
-# from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
-from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
+from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
+# from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
 import random
 random.seed(42)
 import warnings
@@ -72,10 +72,10 @@ class E2EpSE(pl.LightningModule):
         with open(speaker_map_path, "r") as f:
             speaker_map = json.load(f)
 
-        # self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
-        self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
-        # teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
-        teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
+        self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
+        # self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
+        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        # teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
