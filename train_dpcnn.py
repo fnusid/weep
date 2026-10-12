@@ -19,7 +19,8 @@ import wandb
 
 # sys.path.append("/home/sidcs/")
 
-from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
+from models.wespeaker_teacher import WeSpeakerTeacher  # WeSpeaker ResNet34 teacher (pyannote 3.1's embedder)
+# from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
 # from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
 import random
 random.seed(42)
@@ -72,22 +73,26 @@ class E2EpSE(pl.LightningModule):
         with open(speaker_map_path, "r") as f:
             speaker_map = json.load(f)
 
-        self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
+        # WeSpeaker teacher: pretrained weights from the Hugging Face hub (no local checkpoint),
+        # 256-d L2-normalised output, digital silence removed before embedding.
+        self.single_sp_model = WeSpeakerTeacher()
+        assert self.single_sp_model.emb_dim == emb_dim
+        # self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
         # self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
-        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        # teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
         # teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
-        ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
-        state = ckpt["state_dict"]
+        # ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
+        # state = ckpt["state_dict"]
 
-        filtered = {}
-        for k, v in state.items():
-            # only keep model.encoder.* or model.wavlm.*, model.projector.*, model.pooling.*
-            if k.startswith("model.") and ("arcface" not in k):
-                filtered[k.replace("model.", "", 1)] = v
+        # filtered = {}
+        # for k, v in state.items():
+        #     # only keep model.encoder.* or model.wavlm.*, model.projector.*, model.pooling.*
+        #     if k.startswith("model.") and ("arcface" not in k):
+        #         filtered[k.replace("model.", "", 1)] = v
 
-        print("Loaded teacher keys:", len(filtered))
+        # print("Loaded teacher keys:", len(filtered))
 
-        self.single_sp_model.load_state_dict(filtered, strict=True)
+        # self.single_sp_model.load_state_dict(filtered, strict=True)
         self.single_sp_model.eval()
         for param in self.single_sp_model.parameters():
             param.requires_grad = False
@@ -432,11 +437,11 @@ if __name__ == "__main__":
     )
 
     wandb_logger = WandbLogger(
-        project="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
-        name="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
+        project="pDCCRN_2sp_teacher_emb_wespeaker",
+        name="pDCCRN_2sp_teacher_emb_wespeaker",
         # name='test_run',
         log_model=False,
-        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/wandb_logs",
+        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_wespeaker/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -444,7 +449,7 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/",
+        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_wespeaker/",
         save_last=True,  # last.ckpt lets a resubmitted job resume after the time limit
     )
 
@@ -487,10 +492,11 @@ if __name__ == "__main__":
     # )
     # resumes from last.ckpt in the checkpoint dir if present, otherwise starts fresh
     # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
-    # trainer.fit(model, datamodule=dm, ckpt_path="last")
+    # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_wespeaker/last.ckpt")
+    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_wespeaker/last.ckpt")
     # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=35-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=29-val_separation=0.000.ckpt")
-    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
