@@ -2,9 +2,9 @@
 #SBATCH --job-name=train_dpccn_ecapa_teacher
 #SBATCH --partition=pdefault
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
-#SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:4
+#SBATCH --ntasks-per-node=3
+#SBATCH --cpus-per-task=20
+#SBATCH --gres=gpu:3
 #SBATCH --mem=144G
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/sidcs/wesep/slurm_run_logs/%x-%j.out

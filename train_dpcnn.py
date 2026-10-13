@@ -19,8 +19,8 @@ import wandb
 
 # sys.path.append("/home/sidcs/")
 
-from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
-# from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
+# from wavlm_single_embedding.model import SpeakerEncoderWrapper as SingleSpeakerEncoderWrapper  # WavLM teacher
+from wavlm_single_embedding.model import ECAPA_TDNN as SingleSpeakerEncoderWrapper
 import random
 random.seed(42)
 import warnings
@@ -59,6 +59,21 @@ def strip_model_prefix(state):
     return new_state
 
 
+def trim_edges(x, thr=1e-4, pad=160):
+    """Cut the zero padding before the first and after the last sample above `thr`.
+    x: [T] tensor. `pad` keeps 10 ms on each side. Natural pauses inside are untouched."""
+    idx = torch.nonzero(x.abs() > thr).squeeze(-1)
+    if idx.numel() == 0:
+        return x
+    s = max(int(idx[0]) - pad, 0)
+    e = min(int(idx[-1]) + 1 + pad, x.shape[-1])
+    return x[s:e]
+
+@torch.no_grad()
+def embed_trimmed(teacher, srcs):
+    """srcs: [B, T] -> [B, D], each source trimmed on its own."""
+    return torch.stack([teacher(trim_edges(s)[None])[0] for s in srcs])
+
 class E2EpSE(pl.LightningModule):
     def __init__(
         self,
@@ -72,10 +87,10 @@ class E2EpSE(pl.LightningModule):
         with open(speaker_map_path, "r") as f:
             speaker_map = json.load(f)
 
-        self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
-        # self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
-        teacher_ckpt_path = "/home/sidcs/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
-        # teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
+        # self.single_sp_model = SingleSpeakerEncoderWrapper(emb_dim=emb_dim)  # WavLM teacher
+        self.single_sp_model = SingleSpeakerEncoderWrapper(C=1024)  # ECAPA teacher, 256-d output
+        # teacher_ckpt_path = "/tmp/sidcs/turbo/sidcs_backup/model_ckpts/librispeech_asp_wavlm_tr360/best-epoch=62-val_separation=0.000.ckpt"
+        teacher_ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/ecapa_tdnn_arcface_tr360/best-epoch=30-val_separation=0.000.ckpt"
         ckpt = torch.load(teacher_ckpt_path, map_location="cpu")
         state = ckpt["state_dict"]
 
@@ -126,8 +141,10 @@ class E2EpSE(pl.LightningModule):
         """
         mix, source, labels = batch
         with torch.no_grad():
-            emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
-            emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+            # emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
+            # emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+            emb1 = embed_trimmed(self.single_sp_model, source[:, 0, :])
+            emb2 = embed_trimmed(self.single_sp_model, source[:, 1, :])
         
         randomly_chosen_source = random.randint(0,1) #0, or 1
         if randomly_chosen_source == 0:
@@ -171,8 +188,10 @@ class E2EpSE(pl.LightningModule):
         """
         mix, source, labels = batch
         with torch.no_grad():
-            emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
-            emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+            # emb1 = self.single_sp_model(source[:, 0, :])  # [B, emb_dim]
+            # emb2 = self.single_sp_model(source[:, 1, :])  # [B, emb_dim]
+            emb1 = embed_trimmed(self.single_sp_model, source[:, 0, :])
+            emb2 = embed_trimmed(self.single_sp_model, source[:, 1, :])
         
         randomly_chosen_source = random.randint(0,1) #0, or 1
         if randomly_chosen_source == 0:
@@ -279,8 +298,10 @@ class E2EpSE(pl.LightningModule):
 
         # Run forward pass
         with torch.no_grad():
-            emb1 = self.single_sp_model(src[:, 0, :])
-            emb2 = self.single_sp_model(src[:, 1, :])
+            # emb1 = self.single_sp_model(src[:, 0, :])
+            # emb2 = self.single_sp_model(src[:, 1, :])
+            emb1 = embed_trimmed(self.single_sp_model, src[:, 0, :])
+            emb2 = embed_trimmed(self.single_sp_model, src[:, 1, :])
             if idx == 0:
                 emb_tgt = emb1
             else:
@@ -318,8 +339,10 @@ class E2EpSE(pl.LightningModule):
 
         # --- teacher embeddings from clean sources ---
         with torch.no_grad():
-            emb1 = self.single_sp_model(source[:, 0, :])  # [B,D]
-            emb2 = self.single_sp_model(source[:, 1, :])  # [B,D]
+            # emb1 = self.single_sp_model(source[:, 0, :])  # [B,D]
+            # emb2 = self.single_sp_model(source[:, 1, :])  # [B,D]
+            emb1 = embed_trimmed(self.single_sp_model, source[:, 0, :])
+            emb2 = embed_trimmed(self.single_sp_model, source[:, 1, :])
 
             # Evaluate BOTH targets for each mixture
             for idx in [0, 1]:
@@ -415,7 +438,8 @@ if __name__ == "__main__":
     DATA_ROOT = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix" 
     SPEAKER_MAP = "/tmp/sidcs/turbo/sidcs_backup/datasets/LibriMix/LibriMix/Libriuni_05_08/Libri2Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
     # SPEAKER_MAP = "/mnt/disks/data/datasets/Datasets/LibriMix/LibriMix/3sp/Libri3Mix_ovl50to80/wav16k/min/metadata/train360_mapping.json"
-
+    print("NUM GPU :", NUM_GPUS)
+    print("NUM_WORKERS:", CPUS_PER_TASK - 1)
     dm = LibriMixDataModule(
         data_root=DATA_ROOT,
         speaker_map_path=SPEAKER_MAP,
@@ -432,11 +456,11 @@ if __name__ == "__main__":
     )
 
     wandb_logger = WandbLogger(
-        project="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
-        name="pDCCRN_2sp_teacher_emb_ECAPA_normalised",
+        project="pDCCRN_2sp_teacher_emb_ECAPA_silence_trim",
+        name="pDCCRN_2sp_teacher_emb_ECAPA_silence_trim",
         # name='test_run',
         log_model=False,
-        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/wandb_logs",
+        save_dir="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_silence_trim/wandb_logs",
     )
 
     ckpt = pl.callbacks.ModelCheckpoint(
@@ -444,7 +468,7 @@ if __name__ == "__main__":
         mode="min",
         save_top_k=-1,
         filename="best-{epoch}-{val_separation:.3f}",
-        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/",
+        dirpath="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_silence_trim/",
         save_last=True,  # last.ckpt lets a resubmitted job resume after the time limit
     )
 
@@ -456,7 +480,7 @@ if __name__ == "__main__":
         # devices=[0,1,2,3,4,5,6,7],
         devices=NUM_GPUS,
         num_nodes=NUM_NODES,
-        max_epochs=200,
+        max_epochs=100,
         logger=wandb_logger,
         callbacks=[ckpt, LogProgress(every_n_steps=100)],
         enable_progress_bar=False,  # Rich bar is blank in SLURM logs; LogProgress prints instead
@@ -488,9 +512,10 @@ if __name__ == "__main__":
     # resumes from last.ckpt in the checkpoint dir if present, otherwise starts fresh
     # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.fit(model, datamodule=dm, ckpt_path="last")
+    trainer.test(model, datamodule=dm, ckpt_path="last")
     # trainer.fit(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=35-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=29-val_separation=0.000.ckpt")
-    trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
+    # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA_normalised/best-epoch=75-val_separation=0.000.ckpt")
     # trainer.test(model, datamodule=dm, ckpt_path="/tmp/sidcs/turbo/sidcs_backup/model_ckpts/pDCCRN_2sp_teacher_emb_ECAPA/best-epoch=19-val_separation=0.000-v1.ckpt")
     # trainer.validate(model, datamodule=dm, ckpt_path = "/mnt/disks/data/model_ckpts/archive_ckpt/pFCCRN_2sp/best-epoch=60-val_separation=0.000.ckpt")
     wandb.finish()
